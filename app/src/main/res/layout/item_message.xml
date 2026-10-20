@@ -31,7 +31,6 @@
             android:textColor="@color/text"
             android:textSize="14sp"
             android:lineSpacingExtra="3dp"
-            android:textIsSelectable="true"
             android:text="" />
 
         <LinearLayout

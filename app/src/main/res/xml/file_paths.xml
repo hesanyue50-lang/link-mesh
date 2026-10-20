@@ -2,4 +2,5 @@
 <paths>
     <external-files-path name="received" path="LanMesh/" />
     <files-path name="internal" path="." />
+    <cache-path name="cache" path="." />
 </paths>

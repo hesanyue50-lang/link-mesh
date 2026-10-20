@@ -549,6 +549,19 @@ public class MainActivity extends AppCompatActivity implements Bus.Listener {
                         getString(R.string.cancel), null);
             }
         });
+        if (tvAbout != null) {
+            tvAbout.setOnClickListener(new View.OnClickListener() {
+                @Override
+                public void onClick(View v) {
+                    try {
+                        startActivity(new Intent(Intent.ACTION_VIEW,
+                                android.net.Uri.parse("https://github.com/hesanyue50-lang/link-mesh")));
+                    } catch (Throwable t) {
+                        Ui.toast(MainActivity.this, "没有可用的浏览器");
+                    }
+                }
+            });
+        }
         findViewById(R.id.btn_copy_diag).setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
@@ -601,6 +614,21 @@ public class MainActivity extends AppCompatActivity implements Bus.Listener {
                             public void onClick() {
                                 int n = cleanTransferFiles();
                                 Ui.toast(MainActivity.this, "已删除 " + n + " 个文件");
+                            }
+                        },
+                        getString(R.string.cancel), null);
+            }
+        });
+        findViewById(R.id.row_clear_download).setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                Ui.confirm(MainActivity.this, "清空保存目录",
+                        "将删除保存目录（含公共文件夹中已保存的副本）里的全部文件，不影响聊天记录。此操作不可恢复。",
+                        "清空", new Ui.OnClick() {
+                            @Override
+                            public void onClick() {
+                                int n = clearSavedDirFiles();
+                                Ui.toast(MainActivity.this, n > 0 ? "已删除 " + n + " 个文件" : "保存目录已经是空的");
                             }
                         },
                         getString(R.string.cancel), null);
@@ -948,6 +976,39 @@ public class MainActivity extends AppCompatActivity implements Bus.Listener {
         });
     }
 
+    /** 清空「保存目录」：公共 SAF 目录 + 应用专属下载目录。 */
+    private int clearSavedDirFiles() {
+        int n = 0;
+        String tree = core.prefs.saveTreeUri();
+        if (tree != null && tree.length() > 0 && Build.VERSION.SDK_INT >= 21) {
+            try {
+                androidx.documentfile.provider.DocumentFile dir =
+                        androidx.documentfile.provider.DocumentFile.fromTreeUri(
+                                this, android.net.Uri.parse(tree));
+                if (dir != null && dir.canRead()) {
+                    androidx.documentfile.provider.DocumentFile[] list = dir.listFiles();
+                    if (list != null) {
+                        for (androidx.documentfile.provider.DocumentFile f : list) {
+                            try { if (f.delete()) n++; } catch (Throwable ignored) {}
+                        }
+                    }
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+        try {
+            java.io.File dir = com.jiuyue.lanmesh.core.StorageUtil.downloadDir(this);
+            java.io.File[] list = dir.listFiles();
+            if (list != null) {
+                for (java.io.File f : list) {
+                    if (f.isFile() && f.delete()) n++;
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return n;
+    }
+
     private int cleanTransferFiles() {
         int n = 0;
         try {
@@ -1049,9 +1110,8 @@ public class MainActivity extends AppCompatActivity implements Bus.Listener {
                 + (cachedIp == null ? "" : " · 网页 " + cachedIp + ":" + webPort));
         updateBatteryState();
         updateDownloadSettings();
-        tvAbout.setText("Link Mesh " + versionName() + " · 阶段一\n"
-                + "零云成本 · 无账号 · 数据只存本机\n"
-                + "P2P 最低 API " + Const.MIN_P2P_API + "（当前 API " + Build.VERSION.SDK_INT + "）");
+        tvAbout.setText("Link Mesh " + versionName() + "\n"
+                + "github.com/hesanyue50-lang/link-mesh");
     }
 
     private String versionName() {

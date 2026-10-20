@@ -30,6 +30,8 @@ import com.jiuyue.lanmesh.model.Peer;
 import com.jiuyue.lanmesh.net.NetService;
 
 import java.io.File;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Queue;
@@ -245,8 +247,7 @@ public class ChatActivity extends AppCompatActivity implements Bus.Listener {
         Ui.sheet(this, new String[]{
                 getString(R.string.pick_file),
                 getString(R.string.pick_image),
-                "发送本应用安装包",
-                getString(R.string.manual_add_short)
+                "发送本应用安装包"
         }, new Ui.OnClick[]{
                 new Ui.OnClick() {
                     @Override
@@ -264,12 +265,6 @@ public class ChatActivity extends AppCompatActivity implements Bus.Listener {
                     @Override
                     public void onClick() {
                         sendOwnApk();
-                    }
-                },
-                new Ui.OnClick() {
-                    @Override
-                    public void onClick() {
-                        manualAdd();
                     }
                 }
         });
@@ -293,6 +288,18 @@ public class ChatActivity extends AppCompatActivity implements Bus.Listener {
     }
 
     private void launchPicker(String mime, int req) {
+        // ACTION_OPEN_DOCUMENT（SAF）能列出全部文件；部分 ROM 的 GET_CONTENT
+        // 会过滤掉无 MIME/未知类型的文件，导致"只能选一部分"。
+        try {
+            Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+            i.addCategory(Intent.CATEGORY_OPENABLE);
+            i.setType(mime);
+            i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION
+                    | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
+            startActivityForResult(i, req);
+            return;
+        } catch (Throwable ignored) {
+        }
         try {
             Intent i = new Intent(Intent.ACTION_GET_CONTENT);
             i.setType(mime);
@@ -386,7 +393,7 @@ public class ChatActivity extends AppCompatActivity implements Bus.Listener {
         adapter.add(m);
         scrollToBottom();
 
-        NetService s = core.service();
+        final NetService s = core.service();
         if (s == null) {
             m.status = ChatMessage.ST_FAILED;
             m.error = "服务未启动";
@@ -394,49 +401,110 @@ public class ChatActivity extends AppCompatActivity implements Bus.Listener {
             adapter.update(m);
             return;
         }
+
+        // 用户选了公共保存目录时，先把文件复制一份过去，再从公共目录发送。
+        // 大文件复制要时间，放到后台线程，完成后才开始传。
+        final String tree = core.prefs.saveTreeUri();
+        if (localPath == null && uri != null && tree != null && tree.length() > 0) {
+            Ui.toast(this, "正在复制到公共文件夹…");
+            final Uri src = uri;
+            new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    final String copied = com.jiuyue.lanmesh.core.PublicCopy.copyToTree(
+                            ChatActivity.this, tree, src, m.fileName);
+                    runOnUiThread(new Runnable() {
+                        @Override
+                        public void run() {
+                            if (copied != null) {
+                                m.localPath = copied;
+                                core.messages.update(m);
+                                s.sendFile(peer, m, Uri.parse(copied), null);
+                            } else {
+                                // 公共目录复制失败：至少在本机留一份，否则发送方之后打不开
+                                String local = copyToPrivate(src, m.fileName);
+                                if (local != null) {
+                                    m.localPath = local;
+                                    core.messages.update(m);
+                                    Ui.toast(ChatActivity.this, "公共文件夹不可写，已保存到 App 内并发送");
+                                    s.sendFile(peer, m, src, local);
+                                } else {
+                                    Ui.toast(ChatActivity.this, "复制失败，改为直接发送");
+                                    s.sendFile(peer, m, src, null);
+                                }
+                            }
+                        }
+                    });
+                }
+            }, "lanmesh-copy-public").start();
+            return;
+        }
         s.sendFile(peer, m, uri, localPath);
     }
 
     private void openFile(ChatMessage m) {
-        // 发送方：文件还在本机，直接打开原文件/原始 Uri（之前会误报"尚未接收完成"）
-        if (m.isOutgoing()) {
-            if (m.sourcePath != null && new File(m.sourcePath).isFile()) {
-                openLocalFile(new File(m.sourcePath), m.fileName);
+        openWithChooser(m);
+    }
+
+    /** 兼容旧调用：直接走系统打开方式选择器（系统自带滚动，不会只显示一页）。 */
+    private void showOpenWith(ChatMessage m) {
+        openWithChooser(m);
+    }
+
+    private void openWithChooser(ChatMessage m) {
+        Intent base = buildViewIntent(m);
+        if (base == null) {
+            android.util.Log.w("LanMeshOpen", "no uri for " + m.fileName
+                    + " local=" + m.localPath + " source=" + m.sourcePath);
+            Ui.toast(this, "文件不在本机，无法打开（可先保存到公共文件夹）");
+            return;
+        }
+        try {
+            java.util.List<android.content.pm.ResolveInfo> apps =
+                    getPackageManager().queryIntentActivities(base, 0);
+            android.util.Log.i("LanMeshOpen", "open " + m.fileName + " apps=" + apps.size());
+            if (apps.isEmpty()) {
+                Ui.toast(this, "没有应用能打开这种文件，可尝试「定位文件位置」");
                 return;
             }
-            if (m.sourceUri != null) {
-                try {
-                    Intent i = new Intent(Intent.ACTION_VIEW);
-                    i.setDataAndType(Uri.parse(m.sourceUri), guessMime(m.fileName));
-                    i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
-                    startActivity(i);
-                    return;
-                } catch (Throwable ignored) {
+            startActivity(Intent.createChooser(base, "打开方式"));
+        } catch (Throwable t) {
+            android.util.Log.w("LanMeshOpen", "chooser failed", t);
+            Ui.toast(this, "无法打开：" + t.getClass().getSimpleName());
+        }
+    }
+
+    /** 构造 ACTION_VIEW Intent：收发端分别用源文件 / 接收文件。 */
+    private Intent buildViewIntent(ChatMessage m) {
+        try {
+            Uri uri = null;
+            // 优先用本地保存路径（发送方复制到公共目录后也有 localPath）
+            if (m.localPath != null && m.localPath.length() > 0) {
+                if (m.localPath.startsWith("content://")) {
+                    uri = Uri.parse(m.localPath);
+                } else {
+                    File lf = new File(m.localPath);
+                    if (lf.isFile()) {
+                        uri = FileProvider.getUriForFile(this, getPackageName() + ".files", lf);
+                    }
                 }
             }
-        }
-        if (m.localPath == null || m.localPath.length() == 0) {
-            Ui.toast(this, "文件尚未接收完成");
-            return;
-        }
-        if (m.localPath.startsWith("content://")) {
-            try {
-                Intent i = new Intent(Intent.ACTION_VIEW);
-                i.setDataAndType(Uri.parse(m.localPath), guessMime(m.fileName));
-                i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
-                startActivity(i);
-                return;
-            } catch (Throwable t) {
-                Ui.toast(this, "没有可打开该文件的应用");
-                return;
+            if (uri == null && m.isOutgoing()) {
+                if (m.sourcePath != null && new File(m.sourcePath).isFile()) {
+                    uri = FileProvider.getUriForFile(this,
+                            getPackageName() + ".files", new File(m.sourcePath));
+                } else if (m.sourceUri != null) {
+                    uri = Uri.parse(m.sourceUri);
+                }
             }
+            if (uri == null) return null;
+            Intent i = new Intent(Intent.ACTION_VIEW);
+            i.setDataAndType(uri, guessMime(m.fileName));
+            i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+            return i;
+        } catch (Throwable t) {
+            return null;
         }
-        File f = new File(m.localPath);
-        if (!f.isFile()) {
-            Ui.toast(this, "文件已被移动或删除");
-            return;
-        }
-        openLocalFile(f, m.fileName);
     }
 
     private void openLocalFile(File f, String name) {
@@ -492,16 +560,35 @@ public class ChatActivity extends AppCompatActivity implements Bus.Listener {
             android.content.pm.ApplicationInfo ai =
                     getPackageManager().getApplicationInfo(getPackageName(), 0);
             File src = new File(ai.sourceDir);
-            File dst = new File(getCacheDir(), "LanMesh-" + versionName() + ".apk");
+            // 不放 cache（会被系统清），先落到 files/outbox
+            File dir = new File(getFilesDir(), "outbox");
+            if (!dir.exists()) dir.mkdirs();
+            File dst = new File(dir, "LinkMesh-" + versionName() + ".apk");
             java.io.FileInputStream in = new java.io.FileInputStream(src);
             java.io.FileOutputStream out = new java.io.FileOutputStream(dst);
-            byte[] buf = new byte[64 * 1024];
+            byte[] buf = new byte[256 * 1024];
             int n;
             while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
             in.close();
             out.close();
+
+            String tree = core.prefs.saveTreeUri();
+            if (tree != null && tree.length() > 0) {
+                String pub = com.jiuyue.lanmesh.core.PublicCopy.copyToTree(
+                        this, tree, Uri.fromFile(dst), dst.getName());
+                if (pub != null) {
+                    // 注意：pub 是 content:// URI，new File(pub).length() 永远为 0，
+                    // 必须在删除本地副本前取文件大小
+                    String apkName = dst.getName();
+                    long apkSize = dst.length();
+                    dst.delete();
+                    sendFile(Uri.parse(pub), apkName, apkSize, pub);
+                    Ui.toast(this, "安装包已保存到公共文件夹并发送");
+                    return;
+                }
+                Ui.toast(this, "公共文件夹不可写，从 App 内发送");
+            }
             sendFile(null, dst.getName(), dst.length(), dst.getAbsolutePath());
-            Ui.toast(this, "正在发送安装包");
         } catch (Throwable t) {
             Ui.toast(this, "发送安装包失败: " + t.getMessage());
         }
@@ -512,6 +599,29 @@ public class ChatActivity extends AppCompatActivity implements Bus.Listener {
             return getPackageManager().getPackageInfo(getPackageName(), 0).versionName;
         } catch (Throwable t) {
             return "1.1.0";
+        }
+    }
+
+    private String copyToPrivate(Uri src, String name) {
+        java.io.InputStream in = null;
+        java.io.FileOutputStream out = null;
+        try {
+            File dir = new File(getFilesDir(), "outbox");
+            if (!dir.exists()) dir.mkdirs();
+            File dst = new File(dir, name);
+            in = getContentResolver().openInputStream(src);
+            if (in == null) return null;
+            out = new java.io.FileOutputStream(dst);
+            byte[] buf = new byte[256 * 1024];
+            int n;
+            while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+            out.flush();
+            return dst.getAbsolutePath();
+        } catch (Throwable t) {
+            return null;
+        } finally {
+            try { if (in != null) in.close(); } catch (Throwable ignored) {}
+            try { if (out != null) out.close(); } catch (Throwable ignored) {}
         }
     }
 
@@ -534,6 +644,13 @@ public class ChatActivity extends AppCompatActivity implements Bus.Listener {
                 ? m.localPath : "文件尚未接收完成";
         ((TextView) d.findViewById(R.id.dlg_file_path)).setText(path);
         d.findViewById(R.id.dlg_file_open).setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                d.dismiss();
+                openWithChooser(m);
+            }
+        });
+        d.findViewById(R.id.dlg_file_locate).setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
                 d.dismiss();
@@ -588,40 +705,57 @@ public class ChatActivity extends AppCompatActivity implements Bus.Listener {
     }
 
     private void openInFileManager(ChatMessage m) {
-        if (m.localPath == null || m.localPath.length() == 0) {
-            Ui.toast(this, "文件尚未接收完成");
+        String path = m.localPath;
+        if (path == null || path.length() == 0) {
+            Ui.toast(this, "该文件没有保存到本机，无法定位");
             return;
         }
-        File f = new File(m.localPath);
+        // SAF 文件：用 DocumentFile 找到父目录，再交给文件管理器
+        if (path.startsWith("content://")) {
+            try {
+                androidx.documentfile.provider.DocumentFile f =
+                        androidx.documentfile.provider.DocumentFile.fromSingleUri(this, Uri.parse(path));
+                androidx.documentfile.provider.DocumentFile parent = f == null ? null : f.getParentFile();
+                if (parent != null) {
+                    Intent i = new Intent(Intent.ACTION_VIEW);
+                    i.setDataAndType(parent.getUri(), "vnd.android.document/directory");
+                    i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                    startActivity(i);
+                    return;
+                }
+            } catch (Throwable t) {
+                android.util.Log.w("LanMeshOpen", "open saf dir failed", t);
+            }
+            Ui.toast(this, "无法定位到文件夹，可长按复制路径");
+            return;
+        }
+        File f = new File(path);
         if (!f.isFile()) {
             Ui.toast(this, "文件已被移动或删除");
             return;
         }
-        // 用系统 DocumentsUI 直接打开"所在目录"，这是真正的"在文件管理中打开"
-        String abs = f.getAbsolutePath();
-        String prefix = "/storage/emulated/0/";
-        if (Build.VERSION.SDK_INT < 21) {
-            openFile(m);
-            return;
-        }
-        if (abs.startsWith(prefix)) {
-            String rel = abs.substring(prefix.length());
-            int slash = rel.lastIndexOf('/');
-            if (slash > 0) {
-                try {
-                    android.net.Uri uri = android.provider.DocumentsContract.buildDocumentUri(
-                            "com.android.externalstorage.documents", "primary:" + rel.substring(0, slash));
-                    Intent i = new Intent(Intent.ACTION_VIEW);
-                    i.setDataAndType(uri, "vnd.android.document/directory");
-                    i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
-                    startActivity(i);
-                    return;
-                } catch (Throwable ignored) {
+        if (Build.VERSION.SDK_INT >= 21) {
+            String abs = f.getAbsolutePath();
+            String prefix = "/storage/emulated/0/";
+            if (abs.startsWith(prefix)) {
+                String rel = abs.substring(prefix.length());
+                int slash = rel.lastIndexOf('/');
+                if (slash > 0) {
+                    try {
+                        android.net.Uri uri = android.provider.DocumentsContract.buildDocumentUri(
+                                "com.android.externalstorage.documents", "primary:" + rel.substring(0, slash));
+                        Intent i = new Intent(Intent.ACTION_VIEW);
+                        i.setDataAndType(uri, "vnd.android.document/directory");
+                        i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                        startActivity(i);
+                        return;
+                    } catch (Throwable t) {
+                        android.util.Log.w("LanMeshOpen", "open dir failed", t);
+                    }
                 }
             }
         }
-        // 回退：直接打开文件本身
-        openFile(m);
+        Ui.toast(this, "没有可用的文件管理器，路径：" + path);
     }
 
     private void confirmDeleteFile(final ChatMessage m) {
