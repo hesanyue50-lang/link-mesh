@@ -4,3 +4,9 @@ local.properties
 *.iml
 .idea/
 app/libs/*.aar.bak
+
+keystore.properties
+*.jks
+*.keystore
+dist/
+.buildcount
