@@ -1,0 +1,72 @@
+apply plugin: 'com.android.application'
+
+android {
+    namespace 'com.jiuyue.lanmesh'
+    compileSdk 36
+    buildToolsVersion '36.0.0'
+
+    defaultConfig {
+        applicationId 'com.jiuyue.lanmesh'
+        // 红线要求：Android 4.4.4 必须可安装可用
+        minSdk 19
+        targetSdk 35
+        // 版本规则：MAJOR.MINOR.PATCH[-STAGE]
+        //   MAJOR 协议/数据不兼容；MINOR 功能阶段；PATCH 修复
+        //   versionCode 每次发版单调 +1，与 versionName 解耦
+        versionCode 10
+        versionName '1.2.0-beta8'
+        // 底部导航用 Lucide 矢量图标；API 19 上由 AppCompat 负责解析
+        vectorDrawables.useSupportLibrary = true
+        ndk { abiFilters 'arm64-v8a', 'armeabi-v7a' }
+        multiDexEnabled true
+        // 纯 Java，无 Kotlin
+    }
+
+    buildTypes {
+        debug {
+            minifyEnabled false
+        }
+        release {
+            // 阶段一先不做混淆，便于真机抓堆栈；上线前再开
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+
+    compileOptions {
+        // 只用 Java 7 语法层面安全的 API；不使用 java.time / Stream / lambda 依赖
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+
+    lint {
+        abortOnError false
+        checkReleaseBuilds false
+        // 我们主动开启 NewApi 检查，API 19 兼容性靠它兜底
+        disable 'MissingTranslation', 'ExpiredTargetSdkVersion'
+    }
+
+    packagingOptions {
+        resources {
+            excludes += ['META-INF/LICENSE*', 'META-INF/NOTICE*']
+        }
+    }
+}
+
+dependencies {
+    // appcompat 1.6.1 是最后一个 minSdk 14 的稳定版；1.7.x 起 minSdk 21，会破坏红线
+    implementation 'androidx.appcompat:appcompat:1.6.1'
+    implementation 'androidx.core:core:1.9.0'
+    implementation 'androidx.annotation:annotation:1.7.1'
+    implementation 'androidx.documentfile:documentfile:1.0.1'
+    implementation 'androidx.multidex:multidex:2.0.1'
+    // 阶段二：WebRTC（BSD-3-Clause，预编译 AAR 放在 app/libs）
+    implementation(name: 'webrtc', ext: 'aar')
+    // 二维码：core 负责生成，embedded 负责扫码（Camera + 解码）
+    implementation 'com.google.zxing:core:3.5.3'
+    implementation 'com.journeyapps:zxing-android-embedded:4.3.0'
+
+    testImplementation 'junit:junit:4.13.2'
+    // org.json 在 Android JVM 单测里是 stub，需要真实实现才能测序列化
+    testImplementation 'org.json:json:20231013'
+}

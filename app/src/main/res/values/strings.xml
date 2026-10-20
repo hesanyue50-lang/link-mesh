@@ -1,0 +1,106 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Link Mesh</string>
+    <string name="p2p_title">P2P 公网传输</string>
+
+    <!-- 主界面 -->
+    <string name="devices_title">附近设备</string>
+    <string name="devices_hint">同一 Wi-Fi 下自动发现，无需账号与服务器</string>
+    <string name="empty_devices">正在扫描…\n5 秒内未发现时自动启用组播兜底</string>
+    <string name="manual_add">手动添加设备</string>
+    <string name="p2p_entry">P2P / 公网传输</string>
+    <string name="edit_nickname">修改昵称</string>
+    <string name="diag_copy">复制诊断信息</string>
+    <string name="own_id_fmt">本机 %1$s</string>
+    <string name="own_id_name_fmt">本机 %1$s · %2$s</string>
+
+    <!-- P2P 门禁 -->
+    <string name="p2p_low_version_title">系统版本过低</string>
+    <string name="p2p_low_version_msg">P2P 传输需要 Android 5.0 及以上系统。\n当前系统版本：%1$s。\n\n局域网发现、文本与文件传输不受影响，可继续使用。</string>
+    <string name="p2p_unsupported">当前设备不支持 P2P，局域网功能仍可用</string>
+    <string name="p2p_unsupported_title">P2P 不可用</string>
+    <string name="p2p_checking">正在检测 P2P 能力…</string>
+    <string name="p2p_ok">P2P 能力探测通过</string>
+    <string name="p2p_api_fmt">系统 API %1$d · 最低要求 %2$d</string>
+    <string name="know">知道了</string>
+    <string name="retry">重试</string>
+    <string name="cancel">取消</string>
+    <string name="confirm">确认</string>
+    <string name="reject">拒绝</string>
+    <string name="close">关闭</string>
+
+    <!-- 聊天 -->
+    <string name="chat_hint">输入消息…</string>
+    <string name="send">发送</string>
+    <string name="attach">更多</string>
+    <string name="pick_file">发送文件</string>
+    <string name="pick_image">发送图片</string>
+    <string name="manual_add_short">手动添加设备</string>
+    <string name="status_direct">● 直连</string>
+    <string name="status_offline">○ 离线</string>
+    <string name="conn_direct">直连</string>
+    <string name="conn_offline">离线</string>
+    <string name="conn_connecting">连接中</string>
+    <string name="unknown_peer">未知设备</string>
+    <string name="msg_sending">发送中…</string>
+    <string name="msg_failed">发送失败，点击重试</string>
+    <string name="file_size_fmt">%1$s · %2$s</string>
+    <string name="file_done">已完成</string>
+    <string name="file_cancelled">已取消</string>
+    <string name="file_failed">传输失败</string>
+    <string name="file_verifying">校验中…</string>
+    <string name="transfer_progress_fmt">%1$d%% · %2$s/s</string>
+    <string name="transfer_notif_title">正在传输文件</string>
+    <string name="transfer_notif_text">%1$s · %2$d%%</string>
+    <string name="transfer_notif_done">传输完成</string>
+    <string name="stop_transfer">取消传输</string>
+
+    <!-- 手动添加 -->
+    <string name="manual_title">手动添加设备</string>
+    <string name="manual_hint">输入 IP:端口，例如 192.168.1.23:45900</string>
+    <string name="manual_invalid">地址格式不正确，应为 IP:端口</string>
+    <string name="connecting_to">正在连接 %1$s …</string>
+    <string name="connect_failed">连接失败：%1$s</string>
+
+    <!-- 信任确认 -->
+    <string name="trust_title">发现新设备</string>
+    <string name="trust_msg">%1$s\n短 ID：%2$s\n\n是否允许它向我发送消息与文件？拒绝后不会再打扰。</string>
+    <string name="trust_allow">允许并加入信任列表</string>
+    <string name="trust_deny">拒绝</string>
+
+    <!-- 昵称 -->
+    <string name="nickname_title">我的昵称</string>
+    <string name="nickname_hint">其他设备看到的名称</string>
+    <string name="save">保存</string>
+
+    <!-- 通知/服务 -->
+    <string name="service_channel_name">局域网传输</string>
+    <string name="service_channel_desc">保持局域网连接与文件传输</string>
+    <string name="service_title">Link Mesh 正在运行</string>
+    <string name="service_text">局域网发现已开启</string>
+
+    <!-- 底部导航与设置页 -->
+    <string name="tab_lan">局域网</string>
+    <string name="tab_p2p">P2P</string>
+    <string name="tab_settings">设置</string>
+    <string name="lan_title">局域网</string>
+    <string name="lan_sub">同一 Wi-Fi 下自动发现 · 无账号 · 无服务器</string>
+    <string name="p2p_sub">WebRTC 直连 · 阶段二开放</string>
+    <string name="settings_title">设置</string>
+    <string name="settings_sub">所有数据只存在本机，卸载即消失</string>
+    <string name="appearance">外观</string>
+    <string name="theme_follow">跟随系统</string>
+    <string name="theme_light">浅色</string>
+    <string name="theme_dark">深色</string>
+    <string name="identity">身份</string>
+    <string name="nickname_label">昵称</string>
+    <string name="short_id">短 ID</string>
+    <string name="address_label">本机地址</string>
+    <string name="diagnostics">诊断</string>
+    <string name="copy_diag">复制诊断信息</string>
+    <string name="about">关于</string>
+    <string name="edit">编辑</string>
+    <string name="nearby_count">%1$d 台</string>
+    <string name="p2p_retry">重新检测</string>
+    <string name="p2p_stage2_hint">阶段二将使用 WebRTC + 可配置公共 STUN + 手动信令（二维码 / 复制粘贴）；不引入 TURN，打洞 15 秒失败即明确提示，不会无限重试。</string>
+</resources>

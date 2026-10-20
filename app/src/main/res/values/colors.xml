@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 浅色（白天）：中性灰白体系，不使用高饱和品牌色 -->
+<resources>
+    <color name="bg">#F4F5F7</color>
+    <color name="panel">#FFFFFF</color>
+    <color name="panel_hi">#EDEFF3</color>
+    <color name="stroke">#E0E3E8</color>
+    <color name="stroke_strong">#CBD0D8</color>
+
+    <color name="text">#14171B</color>
+    <color name="text_dim">#5C636D</color>
+    <color name="text_faint">#8B929C</color>
+
+    <color name="accent">#0E9E7A</color>
+    <color name="accent_dim">#0B7F62</color>
+    <color name="on_accent">#FFFFFF</color>
+
+    <color name="warn">#B4690E</color>
+    <color name="danger">#E5484D</color>
+    <color name="black">#000000</color>
+    <color name="white">#FFFFFF</color>
+
+    <color name="glass">#F2FFFFFF</color>
+    <color name="glass_night">#F2141619</color>
+    <color name="scrim">#66000000</color>
+    <color name="shadow">#14000000</color>
+</resources>

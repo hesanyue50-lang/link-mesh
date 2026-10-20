@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 夜间：中性近黑 + 冷灰层级，强调色用浅灰而不是彩色 -->
+<resources>
+    <color name="bg">#0B0C0E</color>
+    <color name="panel">#141619</color>
+    <color name="panel_hi">#1B1E22</color>
+    <color name="stroke">#1FFFFFFF</color>
+    <color name="stroke_strong">#33FFFFFF</color>
+
+    <color name="text">#ECEEF2</color>
+    <color name="text_dim">#9BA2AC</color>
+    <color name="text_faint">#646B75</color>
+
+    <color name="accent">#35E0B0</color>
+    <color name="accent_dim">#2BBF95</color>
+    <color name="on_accent">#04120E</color>
+
+    <color name="warn">#F5A524</color>
+    <color name="danger">#FF5C5C</color>
+    <color name="black">#000000</color>
+    <color name="white">#FFFFFF</color>
+
+    <color name="glass">#F2141619</color>
+    <color name="glass_night">#F2141619</color>
+    <color name="scrim">#99000000</color>
+    <color name="shadow">#00000000</color>
+</resources>
