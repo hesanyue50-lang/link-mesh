@@ -325,7 +325,25 @@ public class Session implements Runnable {
             long lastSpeedBytes = job.bytes;
             long deadline = System.currentTimeMillis() + 10 * 60 * 1000L; // 单文件 10 分钟硬超时
 
+            boolean pausedPosted = false;
             while (!job.cancelled) {
+                if (job.paused) {
+                    if (!pausedPosted) {
+                        pausedPosted = true;
+                        msg.status = ChatMessage.ST_PAUSED;
+                        msg.speed = 0;
+                        store.update(msg);
+                        Bus.post(Bus.MESSAGE_UPDATED, msg);
+                    }
+                    try { Thread.sleep(150); } catch (InterruptedException ie) { break; }
+                    continue;
+                }
+                if (pausedPosted) {
+                    pausedPosted = false;
+                    msg.status = ChatMessage.ST_RECEIVING;
+                    store.update(msg);
+                    Bus.post(Bus.MESSAGE_UPDATED, msg);
+                }
                 if (System.currentTimeMillis() > deadline) {
                     error = "接收超时";
                     break;
@@ -374,6 +392,17 @@ public class Session implements Runnable {
                     if (senderSha.length() > 0) sha = senderSha;
                     ok = true;
                     break;
+                } else if (f.type == Protocol.T_PAUSE) {
+                    msg.status = ChatMessage.ST_PAUSED;
+                    msg.error = "对方已暂停";
+                    msg.speed = 0;
+                    store.update(msg);
+                    Bus.post(Bus.MESSAGE_UPDATED, msg);
+                } else if (f.type == Protocol.T_RESUME) {
+                    msg.status = ChatMessage.ST_RECEIVING;
+                    msg.error = null;
+                    store.update(msg);
+                    Bus.post(Bus.MESSAGE_UPDATED, msg);
                 } else if (f.type == Protocol.T_CANCEL) {
                     error = "对方取消";
                     break;

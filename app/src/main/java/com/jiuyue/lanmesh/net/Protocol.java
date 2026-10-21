@@ -46,6 +46,8 @@ public final class Protocol {
     public static final int T_TRUST_REQUEST = 14;
     public static final int T_TRUST_DENIED = 15;
     public static final int T_BYE = 16;
+    public static final int T_PAUSE = 17;
+    public static final int T_RESUME = 18;
 
     public static String typeName(int t) {
         switch (t) {
@@ -65,6 +67,8 @@ public final class Protocol {
             case T_TRUST_REQUEST: return "TRUST_REQUEST";
             case T_TRUST_DENIED: return "TRUST_DENIED";
             case T_BYE: return "BYE";
+            case T_PAUSE: return "PAUSE";
+            case T_RESUME: return "RESUME";
             default: return "T?" + t;
         }
     }

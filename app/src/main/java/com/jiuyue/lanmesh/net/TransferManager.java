@@ -50,6 +50,7 @@ public class TransferManager {
         public final String fileId;
         public final ChatMessage msg;
         public volatile boolean cancelled = false;
+        public volatile boolean paused = false;
         public volatile Socket socket;
         public long total;
         public long bytes;
@@ -71,6 +72,10 @@ public class TransferManager {
             if (p < 0) p = 0;
             return p;
         }
+
+        public void pause() { paused = true; }
+
+        public void resume() { paused = false; }
 
         public void cancel() {
             cancelled = true;
@@ -283,7 +288,47 @@ public class TransferManager {
             long sent = skipped;
             int index = startChunk;
             long lastUi = 0;
+            long lastPing = 0;
+            boolean pausedPosted = false;
             while (!job.cancelled) {
+                if (job.paused) {
+                    if (!pausedPosted) {
+                        pausedPosted = true;
+                        msg.status = ChatMessage.ST_PAUSED;
+                        msg.speed = 0;
+                        store.update(msg);
+                        Bus.post(Bus.MESSAGE_UPDATED, msg);
+                        updateNotification(job, "已暂停", msg.fileName);
+                        try {
+                            JSONObject o = new JSONObject();
+                            o.put("fileId", msg.fileId);
+                            writer.writeJson(Protocol.T_PAUSE, o);
+                        } catch (Throwable ignored) {
+                        }
+                    }
+                    long nowP = System.currentTimeMillis();
+                    if (nowP - lastPing > 5000) {
+                        lastPing = nowP;
+                        try {
+                            writer.writeJson(Protocol.T_PING, new JSONObject());
+                        } catch (Throwable ignored) {
+                        }
+                    }
+                    Thread.sleep(150);
+                    continue;
+                }
+                if (pausedPosted) {
+                    pausedPosted = false;
+                    msg.status = ChatMessage.ST_SENDING;
+                    store.update(msg);
+                    Bus.post(Bus.MESSAGE_UPDATED, msg);
+                    try {
+                        JSONObject o = new JSONObject();
+                        o.put("fileId", msg.fileId);
+                        writer.writeJson(Protocol.T_RESUME, o);
+                    } catch (Throwable ignored) {
+                    }
+                }
                 int n = in.read(buf);
                 if (n < 0) break;
                 if (n == 0) continue;
@@ -427,13 +472,48 @@ public class TransferManager {
         updateNotification(job, "传输", job.msg == null ? "" : job.msg.fileName);
     }
 
+    /** 暂停：保留连接与任务，发送端每 5 秒发 PING 保活。 */
+    public boolean pause(String fileId) {
+        Job job = findJob(fileId);
+        if (job == null || job.cancelled) return false;
+        job.paused = true;
+        job.msg.status = ChatMessage.ST_PAUSED;
+        job.msg.speed = 0;
+        if (store != null) store.update(job.msg);
+        Bus.post(Bus.MESSAGE_UPDATED, job.msg);
+        return true;
+    }
+
+    /** 继续：恢复发送/接收循环。 */
+    public boolean resume(String fileId) {
+        Job job = findJob(fileId);
+        if (job == null || job.cancelled) return false;
+        job.paused = false;
+        job.msg.status = job.msg.isOutgoing()
+                ? ChatMessage.ST_SENDING : ChatMessage.ST_RECEIVING;
+        if (store != null) store.update(job.msg);
+        Bus.post(Bus.MESSAGE_UPDATED, job.msg);
+        return true;
+    }
+
     public boolean cancel(String fileId) {
         Job job;
         synchronized (jobs) {
             job = jobs.get(fileId);
         }
         if (job == null) return false;
-        job.cancel();
+        // 允许"暂停中直接取消"：先解除暂停，状态立即落库，不等传输线程
+        job.paused = false;
+        job.cancelled = true;
+        job.msg.status = ChatMessage.ST_CANCELLED;
+        job.msg.speed = 0;
+        if (job.msg.error == null || job.msg.error.length() == 0) job.msg.error = "已取消";
+        if (store != null) store.update(job.msg);
+        Bus.post(Bus.MESSAGE_UPDATED, job.msg);
+        Socket s = job.socket;
+        if (s != null) {
+            try { s.close(); } catch (Throwable ignored) {}
+        }
         return true;
     }
 

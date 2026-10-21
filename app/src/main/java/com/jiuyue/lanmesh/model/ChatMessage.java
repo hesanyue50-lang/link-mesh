@@ -25,6 +25,7 @@ public class ChatMessage {
     public static final String ST_DONE = "done";
     public static final String ST_FAILED = "failed";
     public static final String ST_CANCELLED = "cancelled";
+    public static final String ST_PAUSED = "paused";
 
     public String msgId;
     public String peerDeviceId;

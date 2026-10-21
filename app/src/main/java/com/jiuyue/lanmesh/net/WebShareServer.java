@@ -138,6 +138,7 @@ public class WebShareServer {
             if (guest == null || guest.length() < 4) guest = "guest";
 
             long contentLength = 0;
+            String rangeHeader = null;
             String line;
             while ((line = readLine(in)) != null && line.length() > 0) {
                 int idx = line.indexOf(':');
@@ -149,6 +150,8 @@ public class WebShareServer {
                             contentLength = Long.parseLong(v);
                         } catch (Throwable ignored) {
                         }
+                    } else if ("range".equals(k)) {
+                        rangeHeader = v;
                     }
                 }
             }
@@ -159,12 +162,19 @@ public class WebShareServer {
                 sendJson(socket, stateJson(guest));
             } else if ("GET".equals(method) && path.startsWith("/app.apk")) {
                 sendApk(socket);
-            } else if ("GET".equals(method) && path.startsWith("/f?")) {
-                String name = param(path, "name");
-                sendFile(socket, name);
+            } else if (("GET".equals(method) || "HEAD".equals(method)) && path.startsWith("/f?")) {
+                sendFile(socket, param(path, "name"), "HEAD".equals(method), rangeHeader);
+            } else if ("GET".equals(method) && path.startsWith("/upload/size")) {
+                uploadSize(socket, param(path, "name"));
             } else if ("PUT".equals(method) && path.startsWith("/upload")) {
                 String name = param(path, "name");
-                receiveFile(socket, in, name, contentLength, guest);
+                long offset = 0;
+                try {
+                    String o = param(path, "offset");
+                    if (o != null) offset = Long.parseLong(o);
+                } catch (Throwable ignored) {
+                }
+                receiveFile(socket, in, name, contentLength, guest, offset);
             } else if ("POST".equals(method) && path.startsWith("/api/clear")) {
                 int n = cleanupAll(ctx);
                 sendJson(socket, "{\"ok\":true,\"removed\":" + n + "}");
@@ -300,14 +310,29 @@ public class WebShareServer {
         return dir;
     }
 
-    private void receiveFile(Socket socket, InputStream in, String name, long length, String guest) throws Exception {
+    private void receiveFile(Socket socket, InputStream in, String name, long length, String guest,
+                             long offset) throws Exception {
         if (name == null || name.length() == 0) {
             sendStatus(socket, 400, "missing name");
             return;
         }
         String safe = Util.safeFileName(name);
-        File target = Util.uniqueFile(relayDir(), safe);
-        FileOutputStream out = new FileOutputStream(target);
+        File target = new File(relayDir(), safe);
+        if (offset > 0 && (!target.isFile() || target.length() != offset)) {
+            // 浏览器报告的续传点和服务端实际收到的字节不一致：从头来
+            offset = 0;
+        }
+        if (offset <= 0) {
+            // 固定文件名：否则同名上传会被 uniqueFile 改名，浏览器续传就找不到原文件
+            target = new File(relayDir(), safe);
+            if (target.isFile()) target.delete();
+        }
+        java.io.RandomAccessFile out = new java.io.RandomAccessFile(target, "rw");
+        if (offset > 0) {
+            out.seek(offset);
+        } else {
+            out.setLength(0);
+        }
         long left = length;
         byte[] buf = new byte[256 * 1024];
         try {
@@ -318,13 +343,25 @@ public class WebShareServer {
                 left -= r;
             }
         } finally {
-            out.flush();
             out.close();
         }
-        addFileMessage(guest, target);
-        String json = "{\"ok\":true,\"name\":\"" + safe.replace("\"", "") + "\"}";
+        if (offset <= 0) addFileMessage(guest, target);
+        String json = "{\"ok\":true,\"name\":\"" + target.getName().replace("\"", "")
+                + "\",\"size\":" + target.length() + "}";
         sendJson(socket, json);
-        Bus.post(Bus.TOAST, "浏览器上传: " + safe + " (" + Util.humanSize(target.length()) + ")");
+        if (offset <= 0) {
+            Bus.post(Bus.TOAST, "浏览器上传: " + target.getName()
+                    + " (" + Util.humanSize(target.length()) + ")");
+        }
+    }
+
+    private void uploadSize(Socket socket, String name) throws Exception {
+        long size = 0;
+        if (name != null) {
+            File f = new File(relayDir(), Util.safeFileName(name));
+            if (f.isFile()) size = f.length();
+        }
+        sendJson(socket, "{\"size\":" + size + "}");
     }
 
     /** 把当前安装包的 APK 直接发给浏览器（用于给未安装的用户下载）。 */
@@ -357,7 +394,7 @@ public class WebShareServer {
         }
     }
 
-    private void sendFile(Socket socket, String name) throws Exception {
+    private void sendFile(Socket socket, String name, boolean head, String range) throws Exception {
         if (name == null) {
             sendStatus(socket, 400, "missing name");
             return;
@@ -371,18 +408,56 @@ public class WebShareServer {
             sendStatus(socket, 404, "not found");
             return;
         }
+        long total = f.length();
+        long start = 0;
+        long end = total - 1;
+        if (range != null && range.startsWith("bytes=")) {
+            try {
+                String spec = range.substring(6).split(",")[0].trim();
+                int dash = spec.indexOf('-');
+                if (dash >= 0) {
+                    String a = spec.substring(0, dash).trim();
+                    String b = spec.substring(dash + 1).trim();
+                    if (a.length() > 0) start = Long.parseLong(a);
+                    if (b.length() > 0) end = Long.parseLong(b);
+                }
+                if (start < 0) start = 0;
+                if (end >= total) end = total - 1;
+                if (start > end) {
+                    sendStatus(socket, 416, "range");
+                    return;
+                }
+            } catch (Throwable t) {
+                start = 0;
+                end = total - 1;
+            }
+        }
+        boolean partial = start > 0 || end < total - 1;
+        long len = end - start + 1;
         OutputStream out = socket.getOutputStream();
-        String header = "HTTP/1.1 200 OK\r\n"
+        String header = "HTTP/1.1 " + (partial ? "206 Partial Content" : "200 OK") + "\r\n"
                 + "Content-Type: application/octet-stream\r\n"
-                + "Content-Length: " + f.length() + "\r\n"
+                + "Content-Length: " + len + "\r\n"
+                + "Accept-Ranges: bytes\r\n"
+                + (partial ? "Content-Range: bytes " + start + "-" + end + "/" + total + "\r\n" : "")
                 + "Content-Disposition: attachment; filename=\"" + safe + "\"\r\n"
                 + "Connection: close\r\n\r\n";
         out.write(header.getBytes("UTF-8"));
-        FileInputStream fin = new FileInputStream(f);
+        if (head) {
+            out.flush();
+            return;
+        }
+        java.io.RandomAccessFile raf = new java.io.RandomAccessFile(f, "r");
+        raf.seek(start);
         byte[] buf = new byte[64 * 1024];
-        int n;
-        while ((n = fin.read(buf)) > 0) out.write(buf, 0, n);
-        fin.close();
+        long left = len;
+        while (left > 0) {
+            int n = raf.read(buf, 0, (int) Math.min(buf.length, left));
+            if (n <= 0) break;
+            out.write(buf, 0, n);
+            left -= n;
+        }
+        raf.close();
         out.flush();
     }
 
@@ -601,6 +676,9 @@ public class WebShareServer {
                 + ".send{flex:none;background:var(--accent);color:var(--on);border:0;border-radius:14px;"
                 + "padding:11px 16px;font-size:14px;font-weight:600;cursor:pointer}"
                 + ".empty{color:var(--dim);text-align:center;margin-top:40px;font-size:13px;line-height:1.8}"
+                + ".acts{margin-top:7px;display:flex;gap:14px}"
+                + ".acts a{font-size:12px;color:var(--accent);cursor:pointer}"
+                + ".acts a.cancel{color:#e06a6a}"
                 + "</style></head><body><div class='app'>"
                 + "<header><div class='dot'></div><div class='who'><h1 id='name'>Link Mesh</h1>"
                 + "<div class='sub' id='sub'>连接中…</div></div>"
@@ -632,31 +710,60 @@ public class WebShareServer {
                 + "html+='<div class=msg '+cls+'><div class=from>'+esc(m.from||'')+'</div>';"
                 + "if(m.type==='file'){html+='<div class=fname>'+esc(m.name)+'</div>';"
                 + "html+='<div class=fmeta>'+m.human+'</div>';"
-                + "html+='<a href=\"/f?name='+encodeURIComponent(m.name)+'\" download>下载</a>';}"
+                + "html+='<a class=dl data-n=\"'+encodeURIComponent(m.name)+'\">下载</a>';}"
                 + "else{html+=esc(m.text);}"
                 + "html+='<time>'+fmt(m.time)+'</time></div>';});"
                 + "box.innerHTML=html||'<div class=empty>还没有消息<br>发一条试试，或点左下角 + 上传文件</div>';"
                 + "if(keep)toBottom();}}).catch(function(){});}"
                 + "function send(){var el=document.getElementById('msg');var v=el.value.trim();if(!v)return;"
                 + "el.value='';fetch('/text'+Q,{method:'POST',body:v}).then(function(){lastCount=-1;refresh();});}"
+                + "var up={file:null,xhr:null,sent:0,paused:false,cancel:false,wrap:null,bar:null,time:null};"
+                + "function startUp(off){if(!up.file||up.cancel)return;var x=new XMLHttpRequest();up.xhr=x;"
+                + "x.open('PUT','/upload?name='+encodeURIComponent(up.file.name)+'&offset='+off+'&g='+encodeURIComponent(G));"
+                + "x.upload.onprogress=function(e){if(!e.lengthComputable)return;var d=off+e.loaded;up.sent=d;"
+                + "up.bar.style.width=(d/up.file.size*100)+'%';up.time.textContent=(d/1048576).toFixed(1)+' / '+(up.file.size/1048576).toFixed(1)+' MB';};"
+                + "x.onload=function(){if(x.status===200){up.wrap&&up.wrap.remove();up.xhr=null;lastCount=-1;refresh();}else{up.time.textContent='上传失败';}};"
+                + "x.onerror=function(){if(!up.paused&&!up.cancel)up.time.textContent='上传失败';};"
+                + "x.send(off>0?up.file.slice(off):up.file);}"
                 + "function upload(){var f=document.getElementById('f').files[0];if(!f)return;"
-                + "document.getElementById('f').value='';"
+                + "document.getElementById('f').value='';up.file=f;up.sent=0;up.paused=false;up.cancel=false;"
                 + "var wrap=document.createElement('div');wrap.className='msg mine';"
                 + "wrap.innerHTML='<div class=fname>'+esc(f.name)+'</div><div class=fmeta>'+human(f.size)+'</div>"
-                + "<div class=progress><i></i></div><time>上传中…</time>';"
-                + "box.appendChild(wrap);toBottom();"
-                + "var bar=wrap.querySelector('.progress i');"
-                + "var xhr=new XMLHttpRequest();"
-                + "xhr.open('PUT','/upload?name='+encodeURIComponent(f.name)+'&g='+encodeURIComponent(G));"
-                + "xhr.upload.onprogress=function(e){if(e.lengthComputable){bar.style.width=(e.loaded/e.total*100)+'%';"
-                + "wrap.querySelector('time').textContent=(e.loaded/1048576).toFixed(1)+' / '+(e.total/1048576).toFixed(1)+' MB';}};"
-                + "xhr.onload=function(){if(xhr.status===200){wrap.remove();lastCount=-1;refresh();}"
-                + "else{wrap.querySelector('time').textContent='上传失败';}};"
-                + "xhr.onerror=function(){wrap.querySelector('time').textContent='上传失败';};"
-                + "xhr.send(f);}"
+                + "<div class=progress><i></i></div><time>上传中…</time>"
+                + "<div class=acts><a class=pause>暂停</a><a class=cancel>取消</a></div>';"
+                + "box.appendChild(wrap);toBottom();up.wrap=wrap;up.bar=wrap.querySelector('.progress i');up.time=wrap.querySelector('time');"
+                + "wrap.querySelector('.pause').onclick=function(){if(up.xhr){up.paused=true;up.xhr.abort();up.xhr=null;this.textContent='继续';up.time.textContent='已暂停';}"
+                + "else{up.paused=false;this.textContent='暂停';up.time.textContent='继续上传…';"
+                + "fetch('/upload/size?name='+encodeURIComponent(up.file.name)+'&g='+encodeURIComponent(G)).then(function(r){return r.json();})"
+                + ".then(function(d){startUp(d.size||0);}).catch(function(){startUp(up.sent);});}};"
+                + "wrap.querySelector('.cancel').onclick=function(){up.cancel=true;if(up.xhr){up.xhr.abort();up.xhr=null;}wrap.remove();};"
+                + "startUp(0);}"
+                + "function download(n){var name=decodeURIComponent(n||'');if(!name)return;"
+                + "var st={name:name,total:0,off:0,chunks:[],paused:false,cancel:false,xhr:null};var CH=524288;"
+                + "var wrap=document.createElement('div');wrap.className='msg other';"
+                + "wrap.innerHTML='<div class=fname>'+esc(name)+'</div><div class=progress><i></i></div><time>连接中…</time>"
+                + "<div class=acts><a class=pause>暂停</a><a class=cancel>取消</a></div>';"
+                + "box.appendChild(wrap);toBottom();var bar=wrap.querySelector('.progress i'),tm=wrap.querySelector('time');"
+                + "function ui(t,p){tm.textContent=t;if(p!=null)bar.style.width=p+'%';}"
+                + "function next(){if(st.paused||st.cancel)return;var end=Math.min(st.total,st.off+CH)-1;"
+                + "var x=new XMLHttpRequest();st.xhr=x;x.open('GET','/f?name='+encodeURIComponent(st.name));"
+                + "if(st.off>0)x.setRequestHeader('Range','bytes='+st.off+'-'+end);x.responseType='arraybuffer';"
+                + "x.onload=function(){if(st.cancel)return;if(x.status!==200&&x.status!==206){ui('下载失败');return;}"
+                + "st.chunks.push(x.response);st.off+=x.response.byteLength;"
+                + "ui((st.off/1048576).toFixed(1)+' / '+(st.total/1048576).toFixed(1)+' MB',st.off/st.total*100);"
+                + "if(st.off<st.total){next();}else{var blob=new Blob(st.chunks);var a=document.createElement('a');"
+                + "a.href=URL.createObjectURL(blob);a.download=st.name;a.click();setTimeout(function(){URL.revokeObjectURL(a.href);},4000);wrap.remove();}};"
+                + "x.onerror=function(){if(!st.paused&&!st.cancel)ui('下载失败');};x.send();}"
+                + "wrap.querySelector('.pause').onclick=function(){if(st.xhr){st.paused=true;st.xhr.abort();st.xhr=null;this.textContent='继续';ui('已暂停 '+(st.off/1048576).toFixed(1)+' MB');}"
+                + "else{st.paused=false;this.textContent='暂停';ui('继续下载…');next();}};"
+                + "wrap.querySelector('.cancel').onclick=function(){st.cancel=true;if(st.xhr){st.xhr.abort();st.xhr=null;}wrap.remove();};"
+                + "fetch('/f?name='+encodeURIComponent(name),{method:'HEAD'}).then(function(r){st.total=parseInt(r.headers.get('Content-Length')||'0',10);"
+                + "if(!st.total){ui('无法获取文件大小');return;}ui('0 / '+(st.total/1048576).toFixed(1)+' MB',0);next();}).catch(function(){ui('下载失败');});}"
+                + "document.getElementById('msgs').addEventListener('click',function(e){var t=e.target;"
+                + "if(t&&t.className&&t.className.indexOf('dl')>=0){download(t.getAttribute('data-n'));}});"
+                + "document.getElementById('f').onchange=upload;"
                 + "document.getElementById('btnFile').onclick=function(){document.getElementById('f').click();};"
                 + "document.getElementById('btnSend').onclick=send;"
-                + "document.getElementById('f').onchange=upload;"
                 + "refresh();setInterval(refresh,2500);"
                 + "</script></body></html>";
     }

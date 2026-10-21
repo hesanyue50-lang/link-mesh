@@ -101,6 +101,9 @@ public class MessageAdapter extends BaseAdapter {
             h.fileInfo = (TextView) convertView.findViewById(R.id.msg_file_info);
             h.progress = (ProgressBar) convertView.findViewById(R.id.msg_progress);
             h.fileStatus = (TextView) convertView.findViewById(R.id.msg_file_status);
+            h.fileActions = convertView.findViewById(R.id.msg_file_actions);
+            h.btnPauseResume = (TextView) convertView.findViewById(R.id.btn_pause_resume);
+            h.btnCancelTransfer = (TextView) convertView.findViewById(R.id.btn_cancel_transfer);
             convertView.setTag(h);
         } else {
             h = (Holder) convertView.getTag();
@@ -139,11 +142,48 @@ public class MessageAdapter extends BaseAdapter {
             String info = Util.humanSize(m.fileSize) + "  " + (out ? "发送" : "接收");
             h.fileInfo.setText(info);
 
+            boolean pausedState = ChatMessage.ST_PAUSED.equals(m.status);
             boolean running = ChatMessage.ST_SENDING.equals(m.status)
-                    || ChatMessage.ST_RECEIVING.equals(m.status);
+                    || ChatMessage.ST_RECEIVING.equals(m.status) || pausedState;
             h.progress.setVisibility(running || ChatMessage.ST_DONE.equals(m.status)
                     ? View.VISIBLE : View.GONE);
             h.progress.setProgress(m.progress);
+
+            final ChatMessage fm = m;
+            h.fileActions.setVisibility(running ? View.VISIBLE : View.GONE);
+            if (running) {
+                boolean peerPaused = pausedState && "对方已暂停".equals(m.error);
+                h.btnPauseResume.setVisibility(peerPaused ? View.GONE : View.VISIBLE);
+                h.btnPauseResume.setText(pausedState ? "继续" : "暂停");
+                h.btnPauseResume.setOnClickListener(new View.OnClickListener() {
+                    @Override
+                    public void onClick(View v) {
+                        com.jiuyue.lanmesh.net.NetService s =
+                                com.jiuyue.lanmesh.core.AppCore.get(ctx).service();
+                        if (s == null) { Ui.toast(ctx, "服务未启动"); return; }
+                        boolean ok;
+                        if (ChatMessage.ST_PAUSED.equals(fm.status)) {
+                            ok = s.transfers().resume(fm.fileId);
+                            Ui.toast(ctx, ok ? "已继续" : "该传输已结束");
+                        } else {
+                            ok = s.transfers().pause(fm.fileId);
+                            Ui.toast(ctx, ok ? "已暂停" : "该传输已结束");
+                        }
+                        android.util.Log.i("LanMeshUI", "toggle ok=" + ok + " id=" + fm.fileId);
+                    }
+                });
+                h.btnCancelTransfer.setOnClickListener(new View.OnClickListener() {
+                    @Override
+                    public void onClick(View v) {
+                        com.jiuyue.lanmesh.net.NetService s =
+                                com.jiuyue.lanmesh.core.AppCore.get(ctx).service();
+                        if (s == null) { Ui.toast(ctx, "服务未启动"); return; }
+                        boolean ok = s.transfers().cancel(fm.fileId);
+                        Ui.toast(ctx, ok ? "已取消传输" : "该传输已结束");
+                        android.util.Log.i("LanMeshUI", "cancel ok=" + ok + " id=" + fm.fileId);
+                    }
+                });
+            }
 
             if (ChatMessage.ST_DONE.equals(m.status)) {
                 h.fileStatus.setTextColor(ctx.getResources().getColor(R.color.accent));
@@ -154,6 +194,11 @@ public class MessageAdapter extends BaseAdapter {
                 h.fileStatus.setTextColor(ctx.getResources().getColor(R.color.danger));
                 h.fileStatus.setText(ctx.getString(R.string.file_failed)
                         + (m.error == null ? "" : "：" + m.error));
+            } else if (ChatMessage.ST_PAUSED.equals(m.status)) {
+                h.fileStatus.setTextColor(ctx.getResources().getColor(R.color.warn));
+                h.fileStatus.setText(m.error != null && m.error.length() > 0
+                        ? m.error + "  " + m.progress + "%"
+                        : "已暂停  " + m.progress + "%");
             } else if (ChatMessage.ST_CANCELLED.equals(m.status)) {
                 h.fileStatus.setTextColor(ctx.getResources().getColor(R.color.warn));
                 h.fileStatus.setText(R.string.file_cancelled);
@@ -186,5 +231,8 @@ public class MessageAdapter extends BaseAdapter {
         TextView fileInfo;
         ProgressBar progress;
         TextView fileStatus;
+        View fileActions;
+        TextView btnPauseResume;
+        TextView btnCancelTransfer;
     }
 }
