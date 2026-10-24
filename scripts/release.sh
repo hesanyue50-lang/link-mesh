@@ -19,7 +19,7 @@ if [ ! -f keystore.properties ]; then
   exit 1
 fi
 
-OLD_CODE=$(sed -n 's/.*versionCode \([0-9]*\).*/\1/p' app/build.gradle | head -1)
+OLD_CODE=$(sed -n 's/^[[:space:]]*versionCode \([0-9]*\).*/\1/p' app/build.gradle | head -1)
 NEW_CODE=$((OLD_CODE + 1))
 sed -i "s/versionCode $OLD_CODE/versionCode $NEW_CODE/" app/build.gradle
 sed -i "s/versionName '[^']*'/versionName '$VERSION'/" app/build.gradle
