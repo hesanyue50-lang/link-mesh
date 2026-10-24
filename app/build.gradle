@@ -19,9 +19,9 @@ android {
         targetSdk 35
         // 版本规则：MAJOR.MINOR.PATCH[-STAGE]
         //   MAJOR 协议/数据不兼容；MINOR 功能阶段；PATCH 修复
-        //   versionCode 1每次发版单调 +1，与 versionName 解耦
+        //   versionCode 45每次发版单调 +1，与 versionName 解耦
         versionCode 144
-        versionName '1.4.2'
+        versionName '1.4.3'
         // 底部导航用 Lucide 矢量图标；API 19 上由 AppCompat 负责解析
         vectorDrawables.useSupportLibrary = true
         ndk { abiFilters 'arm64-v8a', 'armeabi-v7a' }

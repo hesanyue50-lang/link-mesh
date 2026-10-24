@@ -11,6 +11,9 @@ if [ -z "$VERSION" ]; then
 fi
 
 cd "$ROOT"
+
+# 图标 PNG 曾被外部清理误删，构建前先确保存在
+python3 "$ROOT/scripts/gen_icons.py" >/dev/null 2>&1 || true
 if [ ! -f keystore.properties ]; then
   echo "缺少 keystore.properties（storeFile/storePassword/keyAlias/keyPassword）"
   exit 1
