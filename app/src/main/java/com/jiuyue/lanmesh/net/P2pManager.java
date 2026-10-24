@@ -40,6 +40,21 @@ public class P2pManager {
     private String localCode = "";
     private final List<String> logs = new ArrayList<String>();
 
+    // ---- P2P 文件传输状态 ----
+    private static final int P2P_CHUNK = 16 * 1024;
+    private final java.util.concurrent.LinkedBlockingQueue<JSONObject> fileCtl =
+            new java.util.concurrent.LinkedBlockingQueue<JSONObject>();
+    private java.io.RandomAccessFile recvRaf;
+    private java.io.File recvPart;
+    private java.io.File recvTarget;
+    private String recvFileId = "";
+    private String recvName = "";
+    private String recvSha = "";
+    private int recvChunk = P2P_CHUNK;
+    private long recvSize;
+    private long recvBytes;
+    private long recvLastUi;
+
     public static synchronized P2pManager get(Context c) {
         if (instance == null) instance = new P2pManager(c.getApplicationContext());
         return instance;
@@ -123,6 +138,121 @@ public class P2pManager {
         return ok;
     }
 
+    /** 通过 DataChannel 发送文件：16KB 分块 + SHA-256 校验 + 背压。 */
+    public void sendFile(final android.net.Uri uri, final String name, final long size) {
+        if (!isConnected()) {
+            Bus.toast("P2P 尚未连接");
+            return;
+        }
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                java.io.InputStream in = null;
+                try {
+                    final String fileId = java.util.UUID.randomUUID().toString();
+                    in = ctx.getContentResolver().openInputStream(uri);
+                    if (in == null) throw new IllegalStateException("无法打开文件");
+                    String sha = com.jiuyue.lanmesh.core.Util.sha256(in);
+                    in.close();
+                    in = null;
+
+                    JSONObject offer = new JSONObject();
+                    offer.put("fileId", fileId);
+                    offer.put("fileName", name);
+                    offer.put("fileSize", size);
+                    offer.put("chunkSize", P2P_CHUNK);
+                    offer.put("sha256", sha);
+                    if (!session.sendFrame(Protocol.T_FILE_OFFER,
+                            offer.toString().getBytes("UTF-8"))) {
+                        throw new IllegalStateException("发送文件请求失败");
+                    }
+
+                    JSONObject acc = null;
+                    long until = System.currentTimeMillis() + 60000;
+                    while (System.currentTimeMillis() < until) {
+                        JSONObject o = fileCtl.poll(300, java.util.concurrent.TimeUnit.MILLISECONDS);
+                        if (o == null) continue;
+                        int t = o.optInt("__t", -1);
+                        if (t == Protocol.T_FILE_ACCEPT) { acc = o; break; }
+                        if (t == Protocol.T_FILE_REJECT) {
+                            throw new IllegalStateException("对方拒绝接收: "
+                                    + o.optString("reason", ""));
+                        }
+                    }
+                    if (acc == null) throw new IllegalStateException("对方未确认接收（超时）");
+
+                    in = ctx.getContentResolver().openInputStream(uri);
+                    byte[] buf = new byte[P2P_CHUNK];
+                    int idx = 0;
+                    long sent = 0;
+                    long lastUi = 0;
+                    while (in != null) {
+                        int n = in.read(buf);
+                        if (n <= 0) break;
+                        byte[] payload = new byte[4 + n];
+                        payload[0] = (byte) (idx >>> 24);
+                        payload[1] = (byte) (idx >>> 16);
+                        payload[2] = (byte) (idx >>> 8);
+                        payload[3] = (byte) idx;
+                        System.arraycopy(buf, 0, payload, 4, n);
+                        if (!session.sendFrame(Protocol.T_CHUNK, payload)) {
+                            throw new IllegalStateException("发送中断（连接已断开）");
+                        }
+                        sent += n;
+                        idx++;
+                        long now = System.currentTimeMillis();
+                        if (now - lastUi > 500) {
+                            lastUi = now;
+                            int pc = size <= 0 ? 0 : (int) Math.min(100, sent * 100 / size);
+                            Bus.post(Bus.P2P_LOG, "发送 " + name + "  " + pc + "%  "
+                                    + com.jiuyue.lanmesh.core.Util.humanSize(sent) + " / "
+                                    + com.jiuyue.lanmesh.core.Util.humanSize(size));
+                        }
+                    }
+                    in.close();
+                    in = null;
+
+                    JSONObject done = new JSONObject();
+                    done.put("fileId", fileId);
+                    done.put("sha256", sha);
+                    done.put("size", size);
+                    session.sendFrame(Protocol.T_FILE_DONE, done.toString().getBytes("UTF-8"));
+
+                    JSONObject res = null;
+                    long waitRes = System.currentTimeMillis() + 120000;
+                    while (System.currentTimeMillis() < waitRes) {
+                        JSONObject o = fileCtl.poll(300, java.util.concurrent.TimeUnit.MILLISECONDS);
+                        if (o == null) continue;
+                        if (o.optInt("__t", -1) == Protocol.T_FILE_RESULT) { res = o; break; }
+                    }
+                    if (res == null) {
+                        Bus.post(Bus.P2P_LOG, "文件已发出，但没等到对方校验结果");
+                    } else if (!res.optBoolean("ok", false)) {
+                        Bus.post(Bus.P2P_LOG, "对方校验失败：" + res.optString("error", ""));
+                    } else {
+                        Bus.post(Bus.P2P_LOG, "已发送 " + name + "（SHA-256 校验通过）");
+                    }
+                } catch (Throwable t) {
+                    String m = t.getMessage() == null ? t.getClass().getSimpleName() : t.getMessage();
+                    Bus.post(Bus.P2P_LOG, "发送失败：" + m);
+                } finally {
+                    try { if (in != null) in.close(); } catch (Throwable ignored) {}
+                }
+            }
+        }, "p2p-send").start();
+    }
+
+    /** 把当前链路信息（直连/P2P、RTT、收发字节）写进日志。 */
+    public void requestStats() {
+        if (session == null) return;
+        session.requestStats(new WebRtcSession.StatsCallback() {
+            @Override
+            public void onStats(String text) {
+                addLog("链路: " + text);
+            }
+        });
+    }
+
     public boolean isConnected() {
         return session != null && session.isConnected();
     }
@@ -152,6 +282,14 @@ public class P2pManager {
         @Override
         public void onConnected() {
             setState(ST_CONNECTED, "P2P 直连已建立");
+            // 1.5 秒后读一次链路统计（此时 candidate-pair 已选中）
+            new android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(
+                    new Runnable() {
+                        @Override
+                        public void run() {
+                            requestStats();
+                        }
+                    }, 1500);
         }
 
         @Override
@@ -162,6 +300,17 @@ public class P2pManager {
                     String msg = "对方: " + o.optString("text", "");
                     addLog(msg);
                     Bus.post(Bus.P2P_TEXT, msg);
+                } else if (type == Protocol.T_FILE_OFFER) {
+                    handleFileOffer(payload);
+                } else if (type == Protocol.T_CHUNK) {
+                    handleFileChunk(payload);
+                } else if (type == Protocol.T_FILE_DONE) {
+                    handleFileDone(payload);
+                } else if (type == Protocol.T_FILE_ACCEPT || type == Protocol.T_FILE_REJECT
+                        || type == Protocol.T_FILE_RESULT) {
+                    JSONObject o = new JSONObject(new String(payload, "UTF-8"));
+                    o.put("__t", type);
+                    fileCtl.offer(o);
                 }
             } catch (Throwable t) {
                 Log.w(TAG, "frame parse failed", t);
@@ -182,6 +331,119 @@ public class P2pManager {
         public void onError(String message) {
             setState(ST_FAILED, message);
         }
+    }
+
+    // ---------------- 文件接收 ----------------
+
+    private void handleFileOffer(byte[] payload) {
+        try {
+            JSONObject o = new JSONObject(new String(payload, "UTF-8"));
+            String fileId = o.optString("fileId", "");
+            String name = com.jiuyue.lanmesh.core.Util.safeFileName(o.optString("fileName", "file"));
+            long size = o.optLong("fileSize", 0);
+            int chunk = o.optInt("chunkSize", P2P_CHUNK);
+            if (fileId.length() == 0 || size <= 0) return;
+            closeReceive();
+            java.io.File dir = com.jiuyue.lanmesh.core.StorageUtil.downloadDir(ctx);
+            recvPart = new java.io.File(dir, ".p2p-" + fileId);
+            recvTarget = com.jiuyue.lanmesh.core.Util.uniqueFile(dir, name);
+            recvRaf = new java.io.RandomAccessFile(recvPart, "rw");
+            recvRaf.setLength(size);
+            recvFileId = fileId;
+            recvName = name;
+            recvSize = size;
+            recvChunk = chunk;
+            recvSha = o.optString("sha256", "");
+            recvBytes = 0;
+            recvLastUi = 0;
+            JSONObject acc = new JSONObject();
+            acc.put("fileId", fileId);
+            acc.put("bitmap", "");
+            acc.put("chunkSize", chunk);
+            session.sendFrame(Protocol.T_FILE_ACCEPT, acc.toString().getBytes("UTF-8"));
+            Bus.post(Bus.P2P_LOG, "接收 " + name + "（"
+                    + com.jiuyue.lanmesh.core.Util.humanSize(size) + "）…");
+        } catch (Throwable t) {
+            addLog("接收失败：" + t.getMessage());
+        }
+    }
+
+    private void handleFileChunk(byte[] payload) {
+        if (recvRaf == null || payload.length < 5) return;
+        try {
+            int idx = ((payload[0] & 0xFF) << 24) | ((payload[1] & 0xFF) << 16)
+                    | ((payload[2] & 0xFF) << 8) | (payload[3] & 0xFF);
+            int len = payload.length - 4;
+            if (idx < 0) return;
+            long off = (long) idx * recvChunk;
+            if (off + len > recvSize) len = (int) (recvSize - off);
+            if (len <= 0) return;
+            recvRaf.seek(off);
+            recvRaf.write(payload, 4, len);
+            recvBytes += len;
+            long now = System.currentTimeMillis();
+            if (now - recvLastUi > 500) {
+                recvLastUi = now;
+                int pc = recvSize <= 0 ? 0 : (int) Math.min(100, recvBytes * 100 / recvSize);
+                Bus.post(Bus.P2P_LOG, "接收 " + recvName + "  " + pc + "%  "
+                        + com.jiuyue.lanmesh.core.Util.humanSize(recvBytes) + " / "
+                        + com.jiuyue.lanmesh.core.Util.humanSize(recvSize));
+            }
+        } catch (Throwable t) {
+            addLog("写入失败：" + t.getMessage());
+        }
+    }
+
+    private void handleFileDone(byte[] payload) {
+        String okSha = "";
+        String err = "";
+        boolean ok = false;
+        try {
+            JSONObject o = new JSONObject(new String(payload, "UTF-8"));
+            String fileId = o.optString("fileId", "");
+            if (!fileId.equals(recvFileId)) throw new IllegalStateException("文件标识不匹配");
+            if (recvRaf != null) { recvRaf.close(); recvRaf = null; }
+            java.io.InputStream in = new java.io.FileInputStream(recvPart);
+            String actual = com.jiuyue.lanmesh.core.Util.sha256(in);
+            in.close();
+            okSha = actual;
+            if (recvSha.length() > 0 && !recvSha.equalsIgnoreCase(actual)) {
+                err = "SHA-256 不一致";
+            } else if (recvPart.renameTo(recvTarget)) {
+                ok = true;
+            } else {
+                err = "无法保存文件";
+            }
+        } catch (Throwable t) {
+            err = t.getMessage() == null ? t.getClass().getSimpleName() : t.getMessage();
+        }
+        try {
+            JSONObject res = new JSONObject();
+            res.put("fileId", recvFileId);
+            res.put("ok", ok);
+            res.put("sha256", okSha);
+            res.put("error", err);
+            if (session != null) {
+                session.sendFrame(Protocol.T_FILE_RESULT, res.toString().getBytes("UTF-8"));
+            }
+        } catch (Throwable ignored) {
+        }
+        Bus.post(Bus.P2P_LOG, ok
+                ? "已接收 " + recvName + "（SHA-256 校验通过）→ " + recvTarget.getName()
+                : "接收失败：" + err);
+        closeReceive();
+    }
+
+    private void closeReceive() {
+        try { if (recvRaf != null) recvRaf.close(); } catch (Throwable ignored) {}
+        recvRaf = null;
+        if (recvPart != null && recvPart.exists()) recvPart.delete();
+        recvPart = null;
+        recvTarget = null;
+        recvFileId = "";
+        recvName = "";
+        recvSha = "";
+        recvBytes = 0;
     }
 
     private static final String LOCAL_TYPE_OFFER = P2pSignal.TYPE_OFFER;

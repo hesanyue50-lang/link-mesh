@@ -32,6 +32,11 @@ public class WebRtcSession {
 
     private static final String TAG = "LanMeshWebRtc";
 
+    /** DataChannel 背压水位：超过高水位暂停写入，降到低水位恢复。 */
+    private static final long HIGH_WATER = 1024 * 1024;
+    private static final long LOW_WATER = 256 * 1024;
+    private final Object sendLock = new Object();
+
     public interface Callback {
         /** 本地 SDP（含已收集的 ICE）就绪，交给用户复制给对方。 */
         void onLocalSignal(P2pSignal signal);
@@ -88,7 +93,19 @@ public class WebRtcSession {
         public void run() {
             if (!connected && !closed) {
                 Log.w(TAG, "p2p connect timeout");
-                fail("60 秒内未能建立 P2P 连接（可能是对称型 NAT 或防火墙），局域网功能仍可用");
+                int srflx = 0;
+                int host = 0;
+                if (localSignal != null) {
+                    for (P2pSignal.IceEntry e : localSignal.ice) {
+                        if (e.candidate == null) continue;
+                        if (e.candidate.contains(" typ srflx")) srflx++;
+                        else if (e.candidate.contains(" typ host")) host++;
+                    }
+                }
+                String why = srflx == 0
+                        ? "本机没有拿到公网候选（STUN 全超时），当前网络可能禁止 UDP"
+                        : (host == 0 ? "没有局域网候选，双方可能不在同一网段" : "可能是对称型 NAT 或防火墙拦截");
+                fail("60 秒内未能建立 P2P 连接：" + why + "。局域网传输仍可用");
             }
         }
     };
@@ -122,6 +139,8 @@ public class WebRtcSession {
         list.add(PeerConnection.IceServer.builder("stun:stun.chat.bilibili.com:3478").createIceServer());
         list.add(PeerConnection.IceServer.builder("stun:stun.qq.com:3478").createIceServer());
         list.add(PeerConnection.IceServer.builder("stun:stun.l.google.com:19302").createIceServer());
+        list.add(PeerConnection.IceServer.builder("stun:stun.nextcloud.com:443").createIceServer());
+        list.add(PeerConnection.IceServer.builder("stun:stun.syncthing.net:3478").createIceServer());
         return list;
     }
 
@@ -269,6 +288,9 @@ public class WebRtcSession {
         channel.registerObserver(new DataChannel.Observer() {
             @Override
             public void onBufferedAmountChange(long previousAmount) {
+                synchronized (sendLock) {
+                    sendLock.notifyAll();
+                }
             }
 
             @Override
@@ -314,6 +336,23 @@ public class WebRtcSession {
     public boolean sendFrame(int type, byte[] payload) {
         if (!isConnected()) return false;
         try {
+            // 背压：SCTP 发送缓冲超过 1MB 时等待，避免内存暴涨/延迟飙升
+            long waited = 0;
+            synchronized (sendLock) {
+                while (!closed && dc != null && dc.bufferedAmount() > HIGH_WATER) {
+                    try {
+                        sendLock.wait(200);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        return false;
+                    }
+                    waited += 200;
+                    if (waited > 60000) {
+                        Log.w(TAG, "send backpressure timeout");
+                        return false;
+                    }
+                }
+            }
             if (payload == null) payload = new byte[0];
             ByteBuffer buf = ByteBuffer.allocateDirect(5 + payload.length);
             buf.putInt(payload.length);
@@ -363,6 +402,66 @@ public class WebRtcSession {
             pc = null;
         }
         connected = false;
+    }
+
+    public interface StatsCallback {
+        void onStats(String text);
+    }
+
+    /** 读取当前选中的 candidate-pair：链路类型、RTT、收发字节。 */
+    public void requestStats(final StatsCallback cb) {
+        if (pc == null || !connected) {
+            cb.onStats("未连接");
+            return;
+        }
+        try {
+            pc.getStats(new org.webrtc.RTCStatsCollectorCallback() {
+                @Override
+                public void onStatsDelivered(org.webrtc.RTCStatsReport report) {
+                    String text = "暂无链路统计";
+                    try {
+                        java.util.Map<String, org.webrtc.RTCStats> all = report.getStatsMap();
+                        for (org.webrtc.RTCStats st : all.values()) {
+                            if (!"candidate-pair".equals(st.getType())) continue;
+                            java.util.Map<String, Object> m = st.getMembers();
+                            Object state = m.get("state");
+                            if (!"succeeded".equals(String.valueOf(state))) continue;
+                            String lt = candidateType(all, String.valueOf(m.get("localCandidateId")));
+                            String rt = candidateType(all, String.valueOf(m.get("remoteCandidateId")));
+                            Object rtt = m.get("currentRoundTripTime");
+                            double ms = rtt instanceof Number ? ((Number) rtt).doubleValue() * 1000 : 0;
+                            Object bs = m.get("bytesSent");
+                            Object br = m.get("bytesReceived");
+                            text = lt + " → " + rt + "  RTT " + Math.round(ms) + "ms"
+                                    + "  发 " + com.jiuyue.lanmesh.core.Util.humanSize(
+                                    bs instanceof Number ? ((Number) bs).longValue() : 0)
+                                    + "  收 " + com.jiuyue.lanmesh.core.Util.humanSize(
+                                    br instanceof Number ? ((Number) br).longValue() : 0);
+                            break;
+                        }
+                    } catch (Throwable ignored) {
+                    }
+                    cb.onStats(text);
+                }
+            });
+        } catch (Throwable t) {
+            cb.onStats("统计不可用");
+        }
+    }
+
+    private static String candidateType(java.util.Map<String, org.webrtc.RTCStats> all, String id) {
+        try {
+            org.webrtc.RTCStats st = all.get(id);
+            if (st == null) return "?";
+            Object t = st.getMembers().get("candidateType");
+            String s = t == null ? "?" : String.valueOf(t);
+            if ("host".equals(s)) return "直连";
+            if ("srflx".equals(s)) return "P2P";
+            if ("relay".equals(s)) return "中继";
+            return s;
+        } catch (Throwable t) {
+            return "?";
+        }
     }
 
     private void fail(String msg) {

@@ -47,6 +47,7 @@ public class MainActivity extends AppCompatActivity implements Bus.Listener {
     private static final int REQ_NOTIFICATION = 4101;
     private static final int REQ_SCAN_JOIN = 4301;
     private static final int REQ_TREE = 4401;
+    private static final int REQ_P2P_FILE = 4402;
     private static final int REQ_SCAN_ANSWER = 4302;
     private static final int REQ_CAMERA = 4303;
     private boolean pendingScanAnswer = false;
@@ -442,6 +443,22 @@ public class MainActivity extends AppCompatActivity implements Bus.Listener {
                 boolean isAnswer = P2pManager.ST_ANSWER_READY.equals(mgr.state());
                 showSignalDialog(isAnswer ? "应答码" : "邀请码",
                         isAnswer ? "把这段应答码回给对方" : "把这段邀请码发给对方", mgr.localCode());
+            }
+        });
+        findViewById(R.id.btn_p2p_file).setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                if (!P2pManager.get(MainActivity.this).isConnected()) {
+                    Ui.toast(MainActivity.this, "P2P 尚未连接");
+                    return;
+                }
+                Intent i = new Intent(Intent.ACTION_GET_CONTENT);
+                i.setType("*/*");
+                try {
+                    startActivityForResult(Intent.createChooser(i, "选择要发送的文件"), REQ_P2P_FILE);
+                } catch (Throwable t) {
+                    Ui.toast(MainActivity.this, "没有可用的文件选择器");
+                }
             }
         });
         btnP2pSend.setOnClickListener(new View.OnClickListener() {
@@ -1808,6 +1825,28 @@ public class MainActivity extends AppCompatActivity implements Bus.Listener {
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         android.util.Log.i("LanMeshQr", "onActivityResult req=" + requestCode
                 + " res=" + resultCode + " hasData=" + (data != null));
+        if (requestCode == REQ_P2P_FILE) {
+            if (resultCode == RESULT_OK && data != null && data.getData() != null) {
+                android.net.Uri uri = data.getData();
+                String name = "file";
+                long size = 0;
+                try {
+                    androidx.documentfile.provider.DocumentFile doc =
+                            androidx.documentfile.provider.DocumentFile.fromSingleUri(this, uri);
+                    if (doc != null) {
+                        name = doc.getName() == null ? "file" : doc.getName();
+                        size = doc.length();
+                    }
+                } catch (Throwable ignored) {
+                }
+                if (size <= 0) {
+                    Ui.toast(this, "无法读取文件大小");
+                    return;
+                }
+                P2pManager.get(this).sendFile(uri, name, size);
+            }
+            return;
+        }
         if (requestCode == REQ_TREE) {
             if (resultCode == RESULT_OK && data != null && data.getData() != null) {
                 android.net.Uri uri = data.getData();
