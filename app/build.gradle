@@ -20,7 +20,7 @@ android {
         // 版本规则：MAJOR.MINOR.PATCH[-STAGE]
         //   MAJOR 协议/数据不兼容；MINOR 功能阶段；PATCH 修复
         //   versionCode 每次发版单调 +1，与 versionName 解耦
-        versionCode 47
+        versionCode 49
         versionName '1.5.0'
         // 底部导航用 Lucide 矢量图标；API 19 上由 AppCompat 负责解析
         vectorDrawables.useSupportLibrary = true
