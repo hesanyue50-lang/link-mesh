@@ -131,6 +131,8 @@ public class MainActivity extends AppCompatActivity implements Bus.Listener {
     private final Queue<NetService.TrustRequest> trustQueue = new LinkedList<NetService.TrustRequest>();
     private boolean trustShowing = false;
     private String cachedIp;
+    private String cachedTreeUriForName;
+    private String cachedTreeName;
     private static boolean notifAsked = false;
 
     @Override
@@ -148,6 +150,7 @@ public class MainActivity extends AppCompatActivity implements Bus.Listener {
         // lastTabMemory 是静态字段，进程重启后自然为 -1。
         if (AppCore.lastTabMemory >= 0) {
             currentTab = AppCore.lastTabMemory;
+            AppCore.lastTabMemory = -1; // 只用于本次 recreate，用完即清
         } else if (savedInstanceState != null) {
             currentTab = savedInstanceState.getInt(STATE_TAB, TAB_LAN);
         } else {
@@ -306,7 +309,8 @@ public class MainActivity extends AppCompatActivity implements Bus.Listener {
         btnRefresh.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
-                core.peers.clear();
+                // 不清空内存表：已连接/正在聊天的设备会从列表消失，聊天入口也没了。
+                // 让发现结果自己刷新，过期的由 removeExpired 统一收敛。
                 NetService s = core.service();
                 if (s != null) s.restartDiscovery();
                 refresh();
@@ -452,8 +456,11 @@ public class MainActivity extends AppCompatActivity implements Bus.Listener {
                     Ui.toast(MainActivity.this, "P2P 尚未连接");
                     return;
                 }
-                Intent i = new Intent(Intent.ACTION_GET_CONTENT);
+                Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+                i.addCategory(Intent.CATEGORY_OPENABLE);
                 i.setType("*/*");
+                i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION
+                        | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
                 try {
                     startActivityForResult(Intent.createChooser(i, "选择要发送的文件"), REQ_P2P_FILE);
                 } catch (Throwable t) {
@@ -559,8 +566,13 @@ public class MainActivity extends AppCompatActivity implements Bus.Listener {
                         "全部清除", new Ui.OnClick() {
                             @Override
                             public void onClick() {
-                                int n = com.jiuyue.lanmesh.net.WebShareServer.cleanupEverything(MainActivity.this);
-                                Ui.toast(MainActivity.this, "已清除 " + n + " 个会话");
+                                runCleanTask("正在清除…", new java.util.concurrent.Callable<Integer>() {
+                                    @Override
+                                    public Integer call() {
+                                        return com.jiuyue.lanmesh.net.WebShareServer
+                                                .cleanupEverything(MainActivity.this);
+                                    }
+                                }, "已清除 %d 个会话");
                             }
                         },
                         getString(R.string.cancel), null);
@@ -629,8 +641,12 @@ public class MainActivity extends AppCompatActivity implements Bus.Listener {
                         "清理", new Ui.OnClick() {
                             @Override
                             public void onClick() {
-                                int n = cleanTransferFiles();
-                                Ui.toast(MainActivity.this, "已删除 " + n + " 个文件");
+                                runCleanTask("正在清理…", new java.util.concurrent.Callable<Integer>() {
+                                    @Override
+                                    public Integer call() {
+                                        return cleanTransferFiles();
+                                    }
+                                }, "已删除 %d 个文件");
                             }
                         },
                         getString(R.string.cancel), null);
@@ -644,8 +660,12 @@ public class MainActivity extends AppCompatActivity implements Bus.Listener {
                         "清空", new Ui.OnClick() {
                             @Override
                             public void onClick() {
-                                int n = clearSavedDirFiles();
-                                Ui.toast(MainActivity.this, n > 0 ? "已删除 " + n + " 个文件" : "保存目录已经是空的");
+                                runCleanTask("正在清空…", new java.util.concurrent.Callable<Integer>() {
+                                    @Override
+                                    public Integer call() {
+                                        return clearSavedDirFiles();
+                                    }
+                                }, "已删除 %d 个文件");
                             }
                         },
                         getString(R.string.cancel), null);
@@ -684,17 +704,15 @@ public class MainActivity extends AppCompatActivity implements Bus.Listener {
     }
 
     private void applyTheme(final int mode) {
-        // 主题按钮只存在于设置页，切换前把"我在设置页"落盘，
-        // 保证 recreate 后不会跳回局域网页
-        core.prefs.setLastTab(TAB_SETTINGS);
-        AppCore.lastTabMemory = TAB_SETTINGS;
         if (mode == core.prefs.themeMode() && !willRecreate(mode)) {
             animateThemeTo(mode, null);
             return;
         }
         core.prefs.setThemeMode(mode);
         if (!willRecreate(mode)) {
-            // 目标明度与当前一致：不重建、不遮罩，只更新滑块
+            // 目标明度与当前一致：不重建、不遮罩，但必须同步 delegate，
+            // 否则"跟随系统 → 浅色"锁定后，系统入夜仍会变深色
+            AppCompatDelegate.setDefaultNightMode(nightOf(mode));
             animateThemeTo(mode, null);
             return;
         }
@@ -733,21 +751,27 @@ public class MainActivity extends AppCompatActivity implements Bus.Listener {
         return target != nowNight;
     }
 
-    private void applyNightMode(final int mode) {
-        final int night = mode == 1 ? AppCompatDelegate.MODE_NIGHT_NO
+    private int nightOf(int mode) {
+        return mode == 1 ? AppCompatDelegate.MODE_NIGHT_NO
                 : mode == 2 ? AppCompatDelegate.MODE_NIGHT_YES
                 : AppCompatDelegate.MODE_NIGHT_FOLLOW_SYSTEM;
+    }
+
+    private void applyNightMode(final int mode) {
+        final int night = nightOf(mode);
         final android.view.ViewGroup decor =
                 (android.view.ViewGroup) getWindow().getDecorView();
         final View veil = new View(this);
         veil.setBackgroundColor(getResources().getColor(R.color.bg));
         veil.setAlpha(0f);
+        veil.setClickable(true); // 拦截过渡期间的重复点击
         decor.addView(veil, new android.view.ViewGroup.LayoutParams(
                 android.view.ViewGroup.LayoutParams.MATCH_PARENT,
                 android.view.ViewGroup.LayoutParams.MATCH_PARENT));
         final Runnable abort = new Runnable() {
             @Override
             public void run() {
+                if (isFinishing() || isDestroyed()) return;
                 // 极端情况没有触发重建：必须清掉遮罩与标记，否则界面会被盖住
                 AppCore.themeFadeIn = false;
                 try {
@@ -759,6 +783,7 @@ public class MainActivity extends AppCompatActivity implements Bus.Listener {
         veil.animate().alpha(1f).setDuration(180).withEndAction(new Runnable() {
             @Override
             public void run() {
+                if (isFinishing() || isDestroyed()) return;
                 AppCore.themeFadeIn = true;
                 AppCompatDelegate.setDefaultNightMode(night);
             }
@@ -993,24 +1018,33 @@ public class MainActivity extends AppCompatActivity implements Bus.Listener {
         });
     }
 
-    /** 清空「保存目录」：公共 SAF 目录 + 应用专属下载目录。 */
+    /**
+     * 清空「保存目录」。
+     *
+     * 公共 SAF 目录里只删"聊天记录引用到的那些副本"——用户可能把保存目录选成
+     * Download 甚至存储根，整目录 listFiles+delete 会连别人的文件一起删
+     *（DocumentFile.delete 对目录还是递归删除）。
+     */
     private int clearSavedDirFiles() {
         int n = 0;
         String tree = core.prefs.saveTreeUri();
         if (tree != null && tree.length() > 0 && Build.VERSION.SDK_INT >= 21) {
+            java.util.HashSet<String> ours = new java.util.HashSet<String>();
             try {
-                androidx.documentfile.provider.DocumentFile dir =
-                        androidx.documentfile.provider.DocumentFile.fromTreeUri(
-                                this, android.net.Uri.parse(tree));
-                if (dir != null && dir.canRead()) {
-                    androidx.documentfile.provider.DocumentFile[] list = dir.listFiles();
-                    if (list != null) {
-                        for (androidx.documentfile.provider.DocumentFile f : list) {
-                            try { if (f.delete()) n++; } catch (Throwable ignored) {}
+                for (String pid : core.messages.peerIds()) {
+                    for (com.jiuyue.lanmesh.model.ChatMessage m : core.messages.load(pid)) {
+                        if (m.localPath != null && m.localPath.startsWith("content://")) {
+                            ours.add(m.localPath);
                         }
                     }
                 }
             } catch (Throwable ignored) {
+            }
+            for (String path : ours) {
+                try {
+                    if (getContentResolver().delete(android.net.Uri.parse(path), null, null) > 0) n++;
+                } catch (Throwable ignored) {
+                }
             }
         }
         try {
@@ -1024,6 +1058,33 @@ public class MainActivity extends AppCompatActivity implements Bus.Listener {
         } catch (Throwable ignored) {
         }
         return n;
+    }
+
+    /** 删文件/清会话放到后台：文件多时主线程直接删会 ANR。 */
+    private void runCleanTask(final String hint, final java.util.concurrent.Callable<Integer> task,
+                              final String doneFmt) {
+        Ui.toast(this, hint);
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                int n = 0;
+                try {
+                    Integer r = task.call();
+                    if (r != null) n = r;
+                } catch (Throwable ignored) {
+                }
+                final int count = n;
+                runOnUiThread(new Runnable() {
+                    @Override
+                    public void run() {
+                        Ui.toast(MainActivity.this,
+                                count > 0 ? doneFmt.replace("%d", String.valueOf(count)) : "没有可清理的内容");
+                        refresh();
+                        refreshSettings();
+                    }
+                });
+            }
+        }, "lanmesh-clean").start();
     }
 
     private int cleanTransferFiles() {
@@ -1095,6 +1156,10 @@ public class MainActivity extends AppCompatActivity implements Bus.Listener {
             String tree = core.prefs.saveTreeUri();
             if (tree == null || tree.length() == 0) {
                 tvSaveTree.setText("应用专属");
+                cachedTreeUriForName = "";
+                cachedTreeName = null;
+            } else if (tree.equals(cachedTreeUriForName) && cachedTreeName != null) {
+                tvSaveTree.setText(cachedTreeName); // 同一个目录不重复跨进程查询
             } else {
                 String name = "已选择";
                 try {
@@ -1104,6 +1169,8 @@ public class MainActivity extends AppCompatActivity implements Bus.Listener {
                     if (d != null && d.getName() != null) name = d.getName();
                 } catch (Throwable ignored) {
                 }
+                cachedTreeUriForName = tree;
+                cachedTreeName = name;
                 tvSaveTree.setText(name);
             }
         }
@@ -1122,9 +1189,11 @@ public class MainActivity extends AppCompatActivity implements Bus.Listener {
         tvShortId.setText(core.prefs.shortId());
         NetService s = core.service();
         int port = s == null ? 0 : s.getPort();
-        int webPort = 45902;
+        NetService svcForPort = core.service();
+        int webPort = svcForPort == null ? 0 : svcForPort.getWebPort();
+        boolean webOn = svcForPort != null && svcForPort.isWebShareRunning();
         tvAddress.setText((cachedIp == null ? "无 Wi-Fi" : cachedIp) + ":" + port
-                + (cachedIp == null ? "" : " · 网页 " + cachedIp + ":" + webPort));
+                + ((cachedIp == null || !webOn || webPort <= 0) ? "" : " · 网页 " + cachedIp + ":" + webPort));
         updateBatteryState();
         updateDownloadSettings();
         tvAbout.setText("Link Mesh " + versionName() + "\n"
@@ -1293,8 +1362,8 @@ public class MainActivity extends AppCompatActivity implements Bus.Listener {
             row.addView(pageOf(key));
             tabs.addView(navOf(key));
         }
-        layoutSlider();
         if (pager != null) pager.setPage(indexOfKey(currentTab), false);
+        layoutSlider(); // 先滚到目标页再算滑块，否则会先用旧偏移算一帧
         if (segWrap != null) {
             segWrap.animate().cancel();
             segWrap.setAlpha(0.55f);
@@ -1321,7 +1390,7 @@ public class MainActivity extends AppCompatActivity implements Bus.Listener {
     }
 
     private float pageProgress() {
-        if (pager == null || pager.getWidth() == 0) return currentTab;
+        if (pager == null || pager.getWidth() == 0) return indexOfKey(currentTab);
         return pager.getScrollX() / (float) pager.getWidth();
     }
 
@@ -1349,14 +1418,22 @@ public class MainActivity extends AppCompatActivity implements Bus.Listener {
             View tab = g.getChildAt(i);
             if (tab.getVisibility() == View.GONE) continue;
             float t = Math.max(0f, 1f - Math.abs(progress - idx));
+            // 量化到 0.1：拖动时每像素都建 ColorFilter/Typeface 会让低端机明显掉帧
+            t = Math.round(t * 10f) / 10f;
             int c = blendColor(off, on, t);
             try {
                 android.view.ViewGroup tg = (android.view.ViewGroup) tab;
                 ImageView icon = (ImageView) tg.getChildAt(0);
                 TextView label = (TextView) tg.getChildAt(1);
                 label.setTextColor(c);
-                label.setTypeface(null, t > 0.5f ? android.graphics.Typeface.BOLD : android.graphics.Typeface.NORMAL);
                 icon.setColorFilter(c);
+                Boolean bold = (Boolean) label.getTag();
+                boolean wantBold = t > 0.5f;
+                if (bold == null || bold.booleanValue() != wantBold) {
+                    label.setTypeface(null, wantBold
+                            ? android.graphics.Typeface.BOLD : android.graphics.Typeface.NORMAL);
+                    label.setTag(Boolean.valueOf(wantBold));
+                }
             } catch (Throwable ignored) {
             }
             idx++;
@@ -1396,9 +1473,18 @@ public class MainActivity extends AppCompatActivity implements Bus.Listener {
         AppCore.lastTabMemory = key;
         if (key == TAB_P2P) {
             if (Build.VERSION.SDK_INT < Const.MIN_P2P_API) {
-                // 滑动也能到 P2P 页：同样拦截并回退，绝不隐藏入口
+                // 滑动也能到 P2P 页：同样拦截并回退，绝不隐藏入口。
+                // 注意 setPage 的入参是"索引"不是 key：用户隐藏/重排后索引 0 可能正是 P2P，
+                // 直接 setPage(TAB_LAN) 会同步递归到 StackOverflow
                 P2pGate.versionAllowed(this);
-                if (pager != null) pager.setPage(TAB_LAN, true);
+                int fallback = keyOfIndex(0);
+                if (fallback == TAB_P2P) fallback = TAB_SETTINGS;
+                currentTab = fallback;
+                AppCore.lastTabMemory = fallback;
+                if (pager != null) {
+                    int idx = indexOfKey(fallback);
+                    if (pager.getPage() != idx) pager.setPage(idx, true);
+                }
                 return;
             }
             if (!p2pProbed) runP2pProbe();
@@ -1436,6 +1522,22 @@ public class MainActivity extends AppCompatActivity implements Bus.Listener {
         refreshSettings();
         updateWebToggle(isWebRunning(), false);
         lastWebOn = isWebRunning();
+        // IP 只在 onCreate 取一次的话，先开后连 Wi-Fi / 换网段后地址永远是旧的
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                final String ip = Util.localIpv4(MainActivity.this);
+                if (ip == null || ip.equals(cachedIp)) return;
+                cachedIp = ip;
+                runOnUiThread(new Runnable() {
+                    @Override
+                    public void run() {
+                        refresh();
+                        refreshSettings();
+                    }
+                });
+            }
+        }, "lanmesh-ip").start();
         syncP2pUi();
         requestNotificationPermission();
     }
@@ -1443,13 +1545,29 @@ public class MainActivity extends AppCompatActivity implements Bus.Listener {
     @Override
     protected void onPause() {
         Bus.unregister(this);
+        dismissSignalDialog(); // 旋转/切后台：不让 Dialog 挂在已销毁的 Activity 上
         super.onPause();
+    }
+
+    @Override
+    protected void onDestroy() {
+        // 主题动画回调可能持有已销毁的 Activity：不取消会在死实例上叠遮罩
+        if (themeAnim != null) {
+            try { themeAnim.cancel(); } catch (Throwable ignored) {}
+            themeAnim = null;
+        }
+        super.onDestroy();
     }
 
     private void ensureService() {
         if (core.service() == null) {
             try {
-                startService(new Intent(this, NetService.class));
+                // API 26+ 后台不允许 startService，必须走前台服务入口，否则抛异常被吞、服务静默不启动
+                if (Build.VERSION.SDK_INT >= 26) {
+                    startForegroundService(new Intent(this, NetService.class));
+                } else {
+                    startService(new Intent(this, NetService.class));
+                }
             } catch (Throwable ignored) {
             }
         }
@@ -1540,9 +1658,10 @@ public class MainActivity extends AppCompatActivity implements Bus.Listener {
 
     private String webUrl() {
         if (cachedIp == null) return null;
-        int webPort = 45902;
         NetService s = core.service();
-        if (s != null) webPort = s.getWebPort();
+        if (s == null || !s.isWebShareRunning()) return null; // 没在监听就别给死链
+        int webPort = s.getWebPort();
+        if (webPort <= 0) return null;
         return "http://" + cachedIp + ":" + webPort;
     }
 
@@ -1724,24 +1843,8 @@ public class MainActivity extends AppCompatActivity implements Bus.Listener {
         } else if (Bus.P2P_TEXT.equals(type) && payload instanceof String) {
             // 文本消息已由 P2P_LOG 统一处理
         } else if (Bus.FILE_REQUEST.equals(type) && payload instanceof NetService.FileRequest) {
-            final NetService.FileRequest req = (NetService.FileRequest) payload;
-            Ui.confirm(this, "收到文件",
-                    req.fileName + "\n" + Util.humanSize(req.size)
-                            + "\n\n对方正在等待你的确认（60 秒后自动拒绝）。",
-                    "接受", new Ui.OnClick() {
-                        @Override
-                        public void onClick() {
-                            NetService s = core.service();
-                            if (s != null) s.answerFileAccept(req.deviceId, true);
-                        }
-                    },
-                    "拒绝", new Ui.OnClick() {
-                        @Override
-                        public void onClick() {
-                            NetService s = core.service();
-                            if (s != null) s.answerFileAccept(req.deviceId, false);
-                        }
-                    });
+            fileQueue.add((NetService.FileRequest) payload);
+            showNextFileRequest();
         } else if (Bus.TRUST_REQUEST.equals(type) && payload instanceof NetService.TrustRequest) {
             enqueueTrust((NetService.TrustRequest) payload);
         }
@@ -1828,6 +1931,11 @@ public class MainActivity extends AppCompatActivity implements Bus.Listener {
         if (requestCode == REQ_P2P_FILE) {
             if (resultCode == RESULT_OK && data != null && data.getData() != null) {
                 android.net.Uri uri = data.getData();
+                try {
+                    getContentResolver().takePersistableUriPermission(
+                            uri, Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                } catch (Throwable ignored) {
+                }
                 String name = "file";
                 long size = 0;
                 try {
@@ -1933,19 +2041,33 @@ public class MainActivity extends AppCompatActivity implements Bus.Listener {
 
     private void onP2pState(String st) {
         P2pManager mgr = P2pManager.get(this);
+        boolean onP2pPage = currentTab == TAB_P2P;
         if (P2pManager.ST_OFFER_READY.equals(st)) {
             btnP2pAnswer.setVisibility(View.VISIBLE);
-            showSignalDialog("邀请码", "把这段邀请码发给对方；收到对方的应答码后，点「粘贴对方的应答码」。",
-                    mgr.localCode());
+            if (onP2pPage) {
+                showSignalDialog("邀请码", "把这段邀请码发给对方；收到对方的应答码后，点「粘贴对方的应答码」。",
+                        mgr.localCode());
+            } else {
+                Ui.toast(this, "邀请码已生成，去 P2P 页查看");
+            }
         } else if (P2pManager.ST_ANSWER_READY.equals(st)) {
             btnP2pAnswer.setVisibility(View.GONE);
-            showSignalDialog("应答码", "把这段应答码回给对方，等待连接建立。", mgr.localCode());
+            if (onP2pPage) {
+                showSignalDialog("应答码", "把这段应答码回给对方，等待连接建立。", mgr.localCode());
+            } else {
+                Ui.toast(this, "应答码已生成，去 P2P 页查看");
+            }
         } else if (P2pManager.ST_CONNECTED.equals(st)) {
             btnP2pAnswer.setVisibility(View.GONE);
             Ui.toast(this, "P2P 已连接");
             tvP2pLog.append("\n已连接，可以发送文本");
         } else if (P2pManager.ST_FAILED.equals(st)) {
             btnP2pAnswer.setVisibility(View.GONE);
+            if (!onP2pPage) {
+                Ui.toast(this, "P2P 连接失败：" + mgr.detail());
+                syncP2pUi();
+                return;
+            }
             Ui.confirm(this, "P2P 连接失败",
                     mgr.detail() + "\n\n可以改用局域网直连，或让对端用浏览器打开本机网页端。",
                     "打开局域网", new Ui.OnClick() {
@@ -1964,22 +2086,52 @@ public class MainActivity extends AppCompatActivity implements Bus.Listener {
         syncP2pUi();
     }
 
+    private android.app.Dialog dlgSignal;
+    private android.graphics.Bitmap dlgSignalBmp;
+
+    private void dismissSignalDialog() {
+        if (dlgSignal != null) {
+            try { dlgSignal.dismiss(); } catch (Throwable ignored) {}
+            dlgSignal = null;
+        }
+    }
+
     private void showSignalDialog(String title, String hint, String code) {
         if (code == null || code.length() == 0) return;
+        if (isFinishing() || isDestroyed()) return;
+        dismissSignalDialog(); // 连点两次/邀请码→应答码：先关旧的，别叠窗
         final android.app.Dialog d = new android.app.Dialog(this, R.style.DarkDialogTheme);
+        dlgSignal = d;
         d.requestWindowFeature(android.view.Window.FEATURE_NO_TITLE);
         d.setContentView(R.layout.dialog_signal);
         ((TextView) d.findViewById(R.id.dlg_sig_title)).setText(title);
         ((TextView) d.findViewById(R.id.dlg_sig_hint)).setText(hint);
         ((TextView) d.findViewById(R.id.dlg_sig_code)).setText(code);
-        ImageView qr = (ImageView) d.findViewById(R.id.dlg_sig_qr);
-        Bitmap bmp = QrUtil.encode(code, 720);
-        if (bmp != null) {
-            qr.setImageBitmap(bmp);
-            qr.setVisibility(View.VISIBLE);
-        } else {
-            qr.setVisibility(View.GONE);
-        }
+        final ImageView qr = (ImageView) d.findViewById(R.id.dlg_sig_qr);
+        // 二维码在后台生成：1-2KB 信令串在低端机上要几百毫秒，主线程会直接卡住
+        final int px = (int) (220 * getResources().getDisplayMetrics().density);
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                final Bitmap bmp = QrUtil.encode(code, px);
+                runOnUiThread(new Runnable() {
+                    @Override
+                    public void run() {
+                        if (isFinishing() || isDestroyed() || dlgSignal != d) {
+                            if (bmp != null) bmp.recycle();
+                            return;
+                        }
+                        if (bmp != null) {
+                            dlgSignalBmp = bmp;
+                            qr.setImageBitmap(bmp);
+                            qr.setVisibility(View.VISIBLE);
+                        } else {
+                            qr.setVisibility(View.GONE);
+                        }
+                    }
+                });
+            }
+        }, "lanmesh-qr").start();
         d.findViewById(R.id.dlg_sig_copy).setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
@@ -1998,8 +2150,66 @@ public class MainActivity extends AppCompatActivity implements Bus.Listener {
             int width = (int) (getResources().getDisplayMetrics().widthPixels * 0.9f);
             w.setLayout(width, android.view.ViewGroup.LayoutParams.WRAP_CONTENT);
         }
+        d.setOnDismissListener(new android.content.DialogInterface.OnDismissListener() {
+            @Override
+            public void onDismiss(android.content.DialogInterface dialog) {
+                if (dlgSignal == d) dlgSignal = null;
+                if (dlgSignalBmp != null) {
+                    try { dlgSignalBmp.recycle(); } catch (Throwable ignored) {}
+                    dlgSignalBmp = null;
+                }
+            }
+        });
         d.show();
         Ui.animateDialogIn(d, false);
+    }
+
+    private final java.util.ArrayDeque<NetService.FileRequest> fileQueue =
+            new java.util.ArrayDeque<NetService.FileRequest>();
+    private boolean fileShowing = false;
+
+    private void showNextFileRequest() {
+        if (fileShowing) return;
+        final NetService.FileRequest req = fileQueue.poll();
+        if (req == null) return;
+        if (isFinishing() || isDestroyed()) return;
+        fileShowing = true;
+        android.app.Dialog dlg = Ui.confirm(this, "收到文件",
+                req.fileName + "\n" + Util.humanSize(req.size)
+                        + "\n\n对方正在等待你的确认（60 秒后自动拒绝）。",
+                "接受", new Ui.OnClick() {
+                    @Override
+                    public void onClick() {
+                        answerFile(req, true);
+                    }
+                },
+                "拒绝", new Ui.OnClick() {
+                    @Override
+                    public void onClick() {
+                        answerFile(req, false);
+                    }
+                });
+        if (dlg != null) {
+            // 点外部/返回键关掉 = 拒绝，并且必须推进队列
+            dlg.setOnDismissListener(new android.content.DialogInterface.OnDismissListener() {
+                @Override
+                public void onDismiss(android.content.DialogInterface dialog) {
+                    if (fileShowing) answerFile(req, false);
+                }
+            });
+        }
+    }
+
+    private void answerFile(NetService.FileRequest req, boolean accept) {
+        NetService s = core.service();
+        if (s != null) s.answerFileAccept(req.deviceId, accept);
+        fileShowing = false;
+        tvDiag.post(new Runnable() {
+            @Override
+            public void run() {
+                showNextFileRequest();
+            }
+        });
     }
 
     private void enqueueTrust(NetService.TrustRequest req) {
@@ -2015,7 +2225,7 @@ public class MainActivity extends AppCompatActivity implements Bus.Listener {
         String msg = getString(R.string.trust_msg,
                 TextUtils.isEmpty(req.nickname) ? getString(R.string.unknown_peer) : req.nickname,
                 Util.shortId(req.deviceId));
-        Ui.confirm(this, getString(R.string.trust_title), msg,
+        android.app.Dialog dlg = Ui.confirm(this, getString(R.string.trust_title), msg,
                 getString(R.string.trust_allow), new Ui.OnClick() {
                     @Override
                     public void onClick() {
@@ -2028,6 +2238,16 @@ public class MainActivity extends AppCompatActivity implements Bus.Listener {
                         answer(req, false);
                     }
                 });
+        // 点外部/返回键也能关掉：不复位标志的话 trustShowing 永久为 true，
+        // 之后所有信任请求都只入队不弹窗，对端一直等到超时
+        if (dlg != null) {
+            dlg.setOnDismissListener(new android.content.DialogInterface.OnDismissListener() {
+                @Override
+                public void onDismiss(android.content.DialogInterface dialog) {
+                    if (trustShowing) answer(req, false);
+                }
+            });
+        }
     }
 
     private void answer(NetService.TrustRequest req, boolean allow) {

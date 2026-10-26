@@ -63,6 +63,11 @@ public class WebShareServer {
         return port;
     }
 
+    /** 是否真的在监听：start() 端口全被占时会静默失败，对象仍然非空。 */
+    public boolean isRunning() {
+        return running && server != null && !server.isClosed();
+    }
+
     public void start() {
         if (running) return;
         for (int i = 0; i < 10; i++) {
@@ -107,7 +112,7 @@ public class WebShareServer {
         while (running) {
             try {
                 final Socket s = server.accept();
-                s.setSoTimeout(8000);
+                s.setSoTimeout(30000);
                 s.setTcpNoDelay(true);
                 s.setSendBufferSize(256 * 1024);
                 pool.execute(new Runnable() {
@@ -317,7 +322,13 @@ public class WebShareServer {
             return;
         }
         String safe = Util.safeFileName(name);
-        File target = new File(relayDir(), safe);
+        File relay = relayDir();
+        long free = relay.getUsableSpace();
+        if (length > 0 && free > 0 && free < length + 16L * 1024 * 1024) {
+            sendStatus(socket, 507, "insufficient storage");
+            return;
+        }
+        File target = new File(relay, safe);
         if (offset > 0 && (!target.isFile() || target.length() != offset)) {
             // 浏览器报告的续传点和服务端实际收到的字节不一致：从头来
             offset = 0;
@@ -432,6 +443,15 @@ public class WebShareServer {
                 end = total - 1;
             }
         }
+        if (total == 0) {
+            // 空文件：直接 200 + 0 长度，别经过 Range 分支（会算出 end=-1 返回 416）
+            OutputStream empty = socket.getOutputStream();
+            empty.write(("HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n"
+                    + "Content-Length: 0\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n")
+                    .getBytes("UTF-8"));
+            empty.flush();
+            return;
+        }
         boolean partial = start > 0 || end < total - 1;
         long len = end - start + 1;
         OutputStream out = socket.getOutputStream();
@@ -448,17 +468,20 @@ public class WebShareServer {
             return;
         }
         java.io.RandomAccessFile raf = new java.io.RandomAccessFile(f, "r");
-        raf.seek(start);
-        byte[] buf = new byte[64 * 1024];
-        long left = len;
-        while (left > 0) {
-            int n = raf.read(buf, 0, (int) Math.min(buf.length, left));
-            if (n <= 0) break;
-            out.write(buf, 0, n);
-            left -= n;
+        try {
+            raf.seek(start);
+            byte[] buf = new byte[64 * 1024];
+            long left = len;
+            while (left > 0) {
+                int n = raf.read(buf, 0, (int) Math.min(buf.length, left));
+                if (n <= 0) break;
+                out.write(buf, 0, n);
+                left -= n;
+            }
+            out.flush();
+        } finally {
+            try { raf.close(); } catch (Throwable ignored) {}
         }
-        raf.close();
-        out.flush();
     }
 
     private void sendHtml(Socket socket, String html) throws Exception {
@@ -597,8 +620,8 @@ public class WebShareServer {
                 item.put("type", m.type);
                 item.put("time", m.timestamp);
                 item.put("dir", m.direction);
-                boolean mine = ("web-" + guest).equals(m.peerDeviceId)
-                        || com.jiuyue.lanmesh.model.ChatMessage.DIR_OUT.equals(m.direction);
+                // 只有"当前访客"自己发的才算 mine；手机主人发出的 DIR_OUT 对访客来说是对方
+                boolean mine = ("web-" + guest).equals(m.peerDeviceId);
                 item.put("mine", mine);
                 String sender;
                 if (m.peerDeviceId != null && m.peerDeviceId.startsWith("web-")) {

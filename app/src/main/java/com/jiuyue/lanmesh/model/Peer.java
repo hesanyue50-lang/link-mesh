@@ -13,17 +13,17 @@ public class Peer {
     public static final String SRC_MANUAL = "manual";
 
     public final String deviceId;
-    public String nickname;
-    public String host;
-    public int port;
+    public volatile String nickname;
+    public volatile String host;
+    public volatile int port;
     /** 最近一次被听到/通信成功的时间戳（ms）。 */
-    public long lastSeen;
+    public volatile long lastSeen;
     /** 最近一次发现来源，仅用于诊断展示。 */
-    public String source;
+    public volatile String source;
     /** 是否在本地信任列表中。 */
-    public boolean trusted;
+    public volatile boolean trusted;
     /** 由发现层提供的协议版本，握手时会以真实值为准。 */
-    public int protoVersion = 1;
+    public volatile int protoVersion = 1;
 
     public Peer(String deviceId, String nickname, String host, int port, String source) {
         this.deviceId = deviceId;

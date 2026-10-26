@@ -399,10 +399,13 @@ public class Session implements Runnable {
                     store.update(msg);
                     Bus.post(Bus.MESSAGE_UPDATED, msg);
                 } else if (f.type == Protocol.T_RESUME) {
-                    msg.status = ChatMessage.ST_RECEIVING;
-                    msg.error = null;
-                    store.update(msg);
-                    Bus.post(Bus.MESSAGE_UPDATED, msg);
+                    // 本机也处于暂停时，不要被对方的 RESUME 覆盖
+                    if (!job.paused) {
+                        msg.status = ChatMessage.ST_RECEIVING;
+                        msg.error = null;
+                        store.update(msg);
+                        Bus.post(Bus.MESSAGE_UPDATED, msg);
+                    }
                 } else if (f.type == Protocol.T_CANCEL) {
                     error = "对方取消";
                     break;
@@ -468,7 +471,9 @@ public class Session implements Runnable {
                 writer.writeJson(Protocol.T_FILE_RESULT, r);
             } catch (Throwable ignored) {
             }
-            // 保留 .part 供下次续传，但清掉状态里的位图避免"看似完整实际错误"
+            // 保留 .part，但删掉状态位图：否则下次续传会认为"所有块都收到了"，
+            // 直接跳过数据只等 FILE_DONE，反复校验失败
+            stateFile.delete();
             return;
         }
 

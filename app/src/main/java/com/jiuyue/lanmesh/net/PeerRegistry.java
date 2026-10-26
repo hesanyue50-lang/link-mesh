@@ -20,6 +20,8 @@ import java.util.Map;
  */
 public class PeerRegistry {
 
+    private static final String PEER_SHORT_PREFIX = "short-";
+
     private final Map<String, Peer> peers = new LinkedHashMap<String, Peer>();
     private final Prefs prefs;
     private final String selfId;
@@ -32,6 +34,20 @@ public class PeerRegistry {
     public synchronized boolean upsert(String deviceId, String nickname, String host, int port, String source) {
         if (deviceId == null || host == null || port <= 0) return false;
         if (deviceId.equals(selfId)) return false; // 忽略自己（组播会收到自己的包）
+
+        // 短 ID 归一：API 19 上 NSD 拿不到 deviceId，会先用 "short-XXXX" 占位；
+        // 握手拿到真实 deviceId 后如果不清掉，列表里会永久留一条连不上的"幽灵设备"
+        if (deviceId.startsWith(PEER_SHORT_PREFIX)) {
+            String sid = deviceId.substring(PEER_SHORT_PREFIX.length());
+            for (Peer exist : peers.values()) {
+                if (!exist.deviceId.startsWith(PEER_SHORT_PREFIX)
+                        && Util.shortId(exist.deviceId).equalsIgnoreCase(sid)) {
+                    return false; // 已经有真实条目，丢弃这条临时记录
+                }
+            }
+        } else {
+            peers.remove(PEER_SHORT_PREFIX + Util.shortId(deviceId));
+        }
 
         Peer p = peers.get(deviceId);
         boolean changed = false;

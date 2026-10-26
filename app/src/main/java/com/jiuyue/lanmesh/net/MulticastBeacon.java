@@ -62,9 +62,13 @@ public class MulticastBeacon {
         this.listener = l;
     }
 
-    public void start() {
-        if (running) return;
-        running = true;
+    private final Object lifecycle = new Object();
+
+    public boolean start() {
+        synchronized (lifecycle) {
+            if (running) return true;
+            running = true;
+        }
         try {
             WifiManager wm = (WifiManager) ctx.getApplicationContext()
                     .getSystemService(Context.WIFI_SERVICE);
@@ -86,6 +90,13 @@ public class MulticastBeacon {
             socket.setSoTimeout(1000);
             NetworkInterface nif = findWifiInterface();
             if (nif != null) {
+                // 只 joinGroup 只影响"收"；发送出口必须显式指定，
+                // 否则默认路由是移动数据时广播会从 rmnet 出去，局域网一台也收不到
+                try {
+                    socket.setNetworkInterface(nif);
+                } catch (Throwable t) {
+                    Log.w(TAG, "setNetworkInterface failed", t);
+                }
                 socket.joinGroup(new InetSocketAddress(group, Const.MULTICAST_PORT), nif);
                 Log.i(TAG, "joined multicast on " + nif.getName());
             } else {
@@ -94,9 +105,19 @@ public class MulticastBeacon {
             }
         } catch (Throwable t) {
             Log.w(TAG, "multicast init failed", t);
-            running = false;
+            synchronized (lifecycle) {
+                running = false;
+            }
             release();
-            return;
+            return false;
+        }
+
+        // 初始化期间被打断（stop 已执行）：不要再起线程，否则旧 socket 上空转
+        synchronized (lifecycle) {
+            if (!running) {
+                release();
+                return false;
+            }
         }
 
         receiver = new Thread(new Runnable() {
@@ -112,6 +133,7 @@ public class MulticastBeacon {
         timerThread.start();
         timer = new Handler(timerThread.getLooper());
         scheduleNext(200); // 启动后尽快发一次
+        return true;
     }
 
     private void scheduleNext(long delay) {
@@ -164,9 +186,11 @@ public class MulticastBeacon {
     private void receiveLoop() {
         byte[] buf = new byte[2048];
         while (running) {
+            MulticastSocket s = socket;
+            if (s == null) break;
             try {
                 DatagramPacket p = new DatagramPacket(buf, buf.length);
-                socket.receive(p);
+                s.receive(p);
                 int len = p.getLength();
                 if (len <= 0 || len > 1024) continue;
                 String json = new String(p.getData(), p.getOffset(), len, "UTF-8");
@@ -187,27 +211,51 @@ public class MulticastBeacon {
                 }
             } catch (java.net.SocketTimeoutException e) {
                 // 正常：1 秒超时用来检查 running
+            } catch (java.net.SocketException se) {
+                // socket 已被 stop() 关闭：退出，不要在 while(running) 里空转刷日志
+                if (!running) break;
+                Log.w(TAG, "socket error, exit receive loop", se);
+                break;
             } catch (Throwable t) {
-                if (running) Log.w(TAG, "receive failed", t);
+                if (!running) break;
+                Log.w(TAG, "receive failed", t);
             }
         }
     }
 
     private NetworkInterface findWifiInterface() {
+        NetworkInterface fallback = null;
         try {
             Enumeration<NetworkInterface> ifaces = NetworkInterface.getNetworkInterfaces();
             for (NetworkInterface nif : Collections.list(ifaces)) {
                 if (!nif.isUp() || nif.isLoopback()) continue;
+                boolean hasV4 = false;
+                for (java.net.InterfaceAddress a : nif.getInterfaceAddresses()) {
+                    if (a.getAddress() instanceof java.net.Inet4Address
+                            && !a.getAddress().isLoopbackAddress()) {
+                        hasV4 = true;
+                        break;
+                    }
+                }
+                if (!hasV4) continue;
                 String name = nif.getName();
-                if (name != null && name.startsWith("wlan")) return nif;
+                if (name == null) continue;
+                // 常见局域网接口名：wlan0 / eth0 / ap0 / swlan0
+                if (name.startsWith("wlan") || name.startsWith("eth")
+                        || name.startsWith("ap") || name.startsWith("swlan")) {
+                    return nif;
+                }
+                if (fallback == null) fallback = nif;
             }
         } catch (Throwable ignored) {
         }
-        return null;
+        return fallback;
     }
 
     public void stop() {
-        running = false;
+        synchronized (lifecycle) {
+            running = false;
+        }
         if (timerThread != null) {
             timerThread.quit();
             timerThread = null;

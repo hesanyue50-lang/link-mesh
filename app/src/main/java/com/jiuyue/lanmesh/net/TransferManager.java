@@ -311,7 +311,9 @@ public class TransferManager {
                         lastPing = nowP;
                         try {
                             writer.writeJson(Protocol.T_PING, new JSONObject());
-                        } catch (Throwable ignored) {
+                        } catch (Throwable pingErr) {
+                            // 对端已断开：暂停状态不能永远挂着，直接结束
+                            throw new IllegalStateException("连接已断开");
                         }
                     }
                     Thread.sleep(150);

@@ -69,15 +69,15 @@ public class NetService extends Service {
     private PeerRegistry peers;
     private TransferManager transfer;
 
-    private ServerSocket server;
-    private int port = Const.DEFAULT_TCP_PORT;
+    private volatile ServerSocket server;
+    private volatile int port = Const.DEFAULT_TCP_PORT;
 
     private NsdHelper nsd;
     private WebShareServer webShare;
     private android.net.wifi.WifiManager.WifiLock wifiLock;
     private android.os.PowerManager.WakeLock wakeLock;
     private MulticastBeacon beacon;
-    private boolean multicastStarted = false;
+    private volatile boolean multicastStarted = false;
 
     private ExecutorService connPool;
     private HandlerThread workerThread;
@@ -127,7 +127,9 @@ public class NetService extends Service {
         transfer = new TransferManager(this, prefs, store, peers);
         core.attachService(this);
 
-        connPool = Executors.newFixedThreadPool(Const.MAX_CONCURRENT_TRANSFERS);
+        // 注意：等待信任确认的握手会阻塞线程最多 60 秒。用固定 4 线程时，
+// 连续几个未确认连接就能把池占满，正常传输只能排队到超时。
+        connPool = Executors.newCachedThreadPool();
         workerThread = new HandlerThread("lanmesh-worker");
         workerThread.start();
         worker = new Handler(workerThread.getLooper());
@@ -171,10 +173,14 @@ public class NetService extends Service {
         }
         if (connPool != null) connPool.shutdownNow();
         if (workerThread != null) workerThread.quit();
-        for (TrustRequest t : pendingTrust.values()) {
-            t.latch.countDown();
+        synchronized (pendingTrust) {
+            for (TrustRequest t : pendingTrust.values()) t.latch.countDown();
+            pendingTrust.clear();
         }
-        pendingTrust.clear();
+        synchronized (pendingFiles) {
+            for (FileRequest f : pendingFiles.values()) f.latch.countDown();
+            pendingFiles.clear();
+        }
         if (instance == this) instance = null;
         AppCore.get(this).attachService(null);
         super.onDestroy();
@@ -267,7 +273,8 @@ public class NetService extends Service {
 
     // ---------------- TCP 服务端 ----------------
 
-    private void startServer() {
+    private synchronized void startServer() {
+        if (server != null && !server.isClosed()) return;
         for (int i = 0; i < Const.PORT_SCAN_RANGE; i++) {
             int candidate = Const.DEFAULT_TCP_PORT + i;
             ServerSocket ss = null;
@@ -308,6 +315,7 @@ public class NetService extends Service {
             try {
                 s = server.accept();
                 s.setTcpNoDelay(true);
+                // 读超时由 Session 构造函数统一设置（Const.SOCKET_TIMEOUT_MS）
                 final Socket incoming = s;
                 connPool.execute(new Session(NetService.this, incoming, prefs, store, peers, transfer,
                         new Session.TrustGate() {
@@ -420,7 +428,9 @@ public class NetService extends Service {
         }, Const.DISCOVERY_FALLBACK_MS);
     }
 
-    private void startMulticast(String reason) {
+    private int multicastRetry = 0;
+
+    private void startMulticast(final String reason) {
         if (multicastStarted) return;
         multicastStarted = true;
         Log.i(TAG, "start multicast: " + reason);
@@ -433,9 +443,25 @@ public class NetService extends Service {
                     }
                 }
             });
-            beacon.start();
+            if (!beacon.start()) {
+                // 端口被占 / MulticastLock 无权限：复位标志，10 秒后重试，别让降级通道永久瘫痪
+                multicastStarted = false;
+                beacon = null;
+                if (multicastRetry < 3) {
+                    multicastRetry++;
+                    mainHandler.postDelayed(new Runnable() {
+                        @Override
+                        public void run() {
+                            startMulticast("retry " + multicastRetry);
+                        }
+                    }, 10000);
+                }
+                return;
+            }
+            multicastRetry = 0;
         } catch (Throwable t) {
             Log.w(TAG, "multicast start failed", t);
+            multicastStarted = false;
         }
     }
 
@@ -492,10 +518,19 @@ public class NetService extends Service {
             android.app.AlarmManager am = (android.app.AlarmManager)
                     getSystemService(Context.ALARM_SERVICE);
             Intent i = new Intent(this, NetService.class);
-            PendingIntent pi = PendingIntent.getService(this, 101, i,
-                    PendingIntent.FLAG_UPDATE_CURRENT
-                            | (Build.VERSION.SDK_INT >= 23 ? PendingIntent.FLAG_IMMUTABLE : 0));
-            am.set(android.app.AlarmManager.RTC, System.currentTimeMillis() + 1000, pi);
+            int flags = PendingIntent.FLAG_UPDATE_CURRENT
+                    | (Build.VERSION.SDK_INT >= 23 ? PendingIntent.FLAG_IMMUTABLE : 0);
+            // API 26+ 后台不允许 startService，必须走前台服务入口；
+            // RTC 在灭屏时不触发，改用 RTC_WAKEUP
+            PendingIntent pi = Build.VERSION.SDK_INT >= 26
+                    ? PendingIntent.getForegroundService(this, 101, i, flags)
+                    : PendingIntent.getService(this, 101, i, flags);
+            long at = System.currentTimeMillis() + 1000;
+            if (Build.VERSION.SDK_INT >= 23) {
+                am.setExactAndAllowWhileIdle(android.app.AlarmManager.RTC_WAKEUP, at, pi);
+            } else {
+                am.set(android.app.AlarmManager.RTC_WAKEUP, at, pi);
+            }
         } catch (Throwable t) {
             Log.w(TAG, "restart on task removed failed", t);
         }
@@ -505,8 +540,16 @@ public class NetService extends Service {
     /** 阶段三：浏览器访客入口。 */
     private void startWebShare() {
         try {
-            webShare = new WebShareServer(this);
-            webShare.start();
+            final WebShareServer ws = new WebShareServer(this);
+            ws.start();
+            if (!ws.isRunning()) {
+                // 10 个端口全被占：别让 UI 显示"已开启"然后给个死链
+                Log.w(TAG, "web share failed to bind any port");
+                prefs.setWebShareEnabled(false);
+                webShare = null;
+                return;
+            }
+            webShare = ws;
         } catch (Throwable t) {
             Log.w(TAG, "web share start failed", t);
         }
@@ -533,6 +576,8 @@ public class NetService extends Service {
                 beacon.stop();
                 beacon = null;
             }
+            multicastStarted = false; // 否则下次打开局域网时 startMulticast 直接 return
+            PortMapper.stopRenew();   // 别让续约线程在关闭后继续打路由器
             if (webShare != null) {
                 webShare.stop();
                 webShare = null;
@@ -547,7 +592,7 @@ public class NetService extends Service {
     }
 
     public boolean isWebShareRunning() {
-        return webShare != null;
+        return webShare != null && webShare.isRunning();
     }
 
     /** 网页端开关：关闭时清理中转产生的文件。 */
@@ -595,14 +640,16 @@ public class NetService extends Service {
     }
 
     private void scheduleHousekeeping() {
-        worker.post(new Runnable() {
+        // 放在主线程 Handler：worker 上可能正卡着 60 秒的握手，
+        // 过期清理和通知恢复不该跟着停摆
+        mainHandler.post(new Runnable() {
             @Override
             public void run() {
                 ensureServiceNotification();
                 boolean changed = peers.removeExpired();
                 if (changed) Bus.post(Bus.PEERS_CHANGED, null);
                 else if (peers.size() > 0) Bus.post(Bus.PEER_UPDATED, null);
-                worker.postDelayed(this, Const.HEARTBEAT_MS / 2);
+                mainHandler.postDelayed(this, Const.HEARTBEAT_MS / 2);
             }
         });
     }
@@ -612,7 +659,12 @@ public class NetService extends Service {
     private boolean askTrustBlocking(String deviceId, String nickname, String host) {
         TrustRequest req = new TrustRequest(deviceId, nickname, host);
         synchronized (pendingTrust) {
-            pendingTrust.put(deviceId, req);
+            TrustRequest old = pendingTrust.put(deviceId, req);
+            if (old != null) {
+                // 同一设备并发发起第二次连接：放走第一个等待者，否则它的 latch 永远没人 countDown
+                old.answer = 2;
+                old.latch.countDown();
+            }
         }
         Bus.post(Bus.TRUST_REQUEST, req);
         try {
@@ -620,7 +672,7 @@ public class NetService extends Service {
         } catch (InterruptedException ignored) {
         }
         synchronized (pendingTrust) {
-            pendingTrust.remove(deviceId);
+            if (pendingTrust.get(deviceId) == req) pendingTrust.remove(deviceId);
         }
         if (req.answer == 1) {
             prefs.deny(deviceId);
@@ -643,7 +695,11 @@ public class NetService extends Service {
     public boolean askFileAccept(String deviceId, String fileName, long size) {
         FileRequest req = new FileRequest(deviceId, fileName, size);
         synchronized (pendingFiles) {
-            pendingFiles.put(deviceId, req);
+            FileRequest old = pendingFiles.put(deviceId, req);
+            if (old != null) {
+                old.answer = 2; // 同设备并发：让旧的直接超时返回
+                old.latch.countDown();
+            }
         }
         Bus.post(Bus.FILE_REQUEST, req);
         try {
@@ -651,7 +707,7 @@ public class NetService extends Service {
         } catch (InterruptedException ignored) {
         }
         synchronized (pendingFiles) {
-            pendingFiles.remove(deviceId);
+            if (pendingFiles.get(deviceId) == req) pendingFiles.remove(deviceId);
         }
         return req.answer == 0;
     }

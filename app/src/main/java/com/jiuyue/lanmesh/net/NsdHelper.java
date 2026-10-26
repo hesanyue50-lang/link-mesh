@@ -82,7 +82,7 @@ public class NsdHelper {
         }
     }
 
-    private void register() {
+    private NsdServiceInfo buildInfo() {
         NsdServiceInfo info = new NsdServiceInfo();
         info.setServiceName(serviceName);
         info.setServiceType(Const.SERVICE_TYPE);
@@ -97,6 +97,11 @@ public class NsdHelper {
                 Log.w(TAG, "setAttribute failed", t);
             }
         }
+        return info;
+    }
+
+    private void register() {
+        NsdServiceInfo info = buildInfo();
         regListener = new NsdManager.RegistrationListener() {
             @Override
             public void onServiceRegistered(NsdServiceInfo serviceInfo) {
@@ -106,7 +111,22 @@ public class NsdHelper {
             @Override
             public void onRegistrationFailed(NsdServiceInfo serviceInfo, int errorCode) {
                 Log.w(TAG, "register failed: " + errorCode);
-                // 服务名冲突 / ROM 限制：不致命，组播仍可发现
+                // 3 = FAILURE_ALREADY_ACTIVE：刚 unregister 完立刻 register 会撞上，
+                // 延迟 500ms 重试一次，否则刷新后别人永远搜不到本机
+                if (errorCode == 3 || errorCode == 1) {
+                    new android.os.Handler(android.os.Looper.getMainLooper())
+                            .postDelayed(new Runnable() {
+                                @Override
+                                public void run() {
+                                    if (!running) return;
+                                    try {
+                                        nsd.registerService(buildInfo(), NsdManager.PROTOCOL_DNS_SD, regListener);
+                                    } catch (Throwable ignored) {
+                                    }
+                                }
+                            }, 600);
+                    return;
+                }
                 listener.onError("NSD 注册失败(" + errorCode + ")，使用组播兜底");
             }
 
@@ -148,7 +168,13 @@ public class NsdHelper {
 
             @Override
             public void onServiceFound(NsdServiceInfo info) {
-                if (!Const.SERVICE_TYPE.equals(info.getServiceType())) return;
+                if (!running) return; // stop() 之后回调仍会到达，别把已清空的列表又填回去
+                String t = info == null ? null : info.getServiceType();
+                if (t == null) return;
+                t = t.toLowerCase(java.util.Locale.US);
+                if (t.endsWith(".")) t = t.substring(0, t.length() - 1);
+                // 部分 ROM 的 serviceType 带尾点或大小写差异，严格 equals 会把邻居全过滤掉
+                if (!t.startsWith(Const.SERVICE_TYPE.toLowerCase(java.util.Locale.US))) return;
                 if (serviceName.equals(info.getServiceName())) return; // 自己
                 enqueueResolve(info);
             }
@@ -166,8 +192,14 @@ public class NsdHelper {
         }
     }
 
+    private String resolvingName;
+
     private void enqueueResolve(NsdServiceInfo info) {
         synchronized (resolveQueue) {
+            // 正在解析的那台也要去重：mDNS 会周期性重复上报，
+            // 否则同一个服务会被反复入队，把新设备挤到队尾
+            if (info.getServiceName() != null
+                    && info.getServiceName().equals(resolvingName)) return;
             // 同一个服务名（同一设备）可能被多次上报，队列内去重
             for (NsdServiceInfo q : resolveQueue) {
                 if (q.getServiceName().equals(info.getServiceName())) return;
@@ -183,6 +215,7 @@ public class NsdHelper {
         final NsdServiceInfo info;
         synchronized (resolveQueue) {
             info = resolveQueue.poll();
+            resolvingName = info == null ? null : info.getServiceName();
             if (info == null) {
                 resolving = false;
                 return;
@@ -207,6 +240,7 @@ public class NsdHelper {
             @Override
             public void onServiceResolved(NsdServiceInfo serviceInfo) {
                 try {
+                    if (!running) return; // 已 stop：不再投递 peer（finally 里仍会推进队列）
                     String host = null;
                     // 注意：不要用 getHostAddresses()。它在 API 21 返回 InetAddress[]，
                     // API 34 改成 List<InetAddress>，compileSdk 36 编译出的字节码在
@@ -252,6 +286,7 @@ public class NsdHelper {
                 } finally {
                     synchronized (resolveQueue) {
                         resolving = false;
+                        resolvingName = null;
                     }
                     new android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(new Runnable() {
                         @Override

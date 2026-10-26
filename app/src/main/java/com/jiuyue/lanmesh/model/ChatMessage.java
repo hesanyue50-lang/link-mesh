@@ -80,6 +80,9 @@ public class ChatMessage {
         o.put("localPath", localPath == null ? "" : localPath);
         o.put("error", error == null ? "" : error);
         o.put("transferMode", transferMode == null ? "local" : transferMode);
+        // 发送源信息要落盘：否则 App 重启后点"重试"没有文件可读
+        o.put("sourcePath", sourcePath == null ? "" : sourcePath);
+        o.put("sourceUri", sourceUri == null ? "" : sourceUri);
         return o;
     }
 
@@ -99,6 +102,8 @@ public class ChatMessage {
         m.localPath = o.optString("localPath", "");
         m.error = o.optString("error", "");
         m.transferMode = o.optString("transferMode", "local");
+        m.sourcePath = o.optString("sourcePath", "");
+        m.sourceUri = o.optString("sourceUri", "");
         return m;
     }
 }

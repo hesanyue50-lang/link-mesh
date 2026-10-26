@@ -33,6 +33,43 @@ public final class AppCore {
         this.prefs = new Prefs(app);
         this.messages = new MessageStore(app);
         this.peers = new PeerRegistry(prefs);
+        // 放后台：启动时可能有几十个会话文件，别卡主线程
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                recoverStaleTransfers();
+            }
+        }, "lanmesh-recover").start();
+    }
+
+    /**
+     * 进程被杀后，处于 sending/receiving/paused 的消息已经没有任何传输任务了，
+     * 界面会永远停在"已暂停 45%"。启动时统一标成失败，用户可以重新发送。
+     */
+    private void recoverStaleTransfers() {
+        try {
+            for (String pid : messages.peerIds()) {
+                boolean dirty = false;
+                java.util.List<com.jiuyue.lanmesh.model.ChatMessage> list = messages.load(pid);
+                for (com.jiuyue.lanmesh.model.ChatMessage m : list) {
+                    if (com.jiuyue.lanmesh.model.ChatMessage.TYPE_FILE.equals(m.type)
+                            && (com.jiuyue.lanmesh.model.ChatMessage.ST_SENDING.equals(m.status)
+                            || com.jiuyue.lanmesh.model.ChatMessage.ST_RECEIVING.equals(m.status)
+                            || com.jiuyue.lanmesh.model.ChatMessage.ST_PAUSED.equals(m.status))) {
+                        m.status = com.jiuyue.lanmesh.model.ChatMessage.ST_FAILED;
+                        m.error = "传输中断（App 已重启）";
+                        m.speed = 0;
+                        messages.update(m);
+                        dirty = true;
+                    }
+                }
+                if (dirty) {
+                    android.util.Log.i("LanMeshCore", "recovered stale transfers for " + pid);
+                }
+            }
+        } catch (Throwable t) {
+            android.util.Log.w("LanMeshCore", "recover stale transfers failed", t);
+        }
     }
 
     public static synchronized AppCore get(Context ctx) {

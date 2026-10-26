@@ -63,8 +63,8 @@ public class WebRtcSession {
     private DataChannel dc;
     private P2pSignal localSignal;
     private Callback callback;
-    private boolean closed;
-    private boolean connected;
+    private volatile boolean closed;
+    private volatile boolean connected;
     private boolean isOfferer;
     private final List<IceCandidate> pendingRemoteIce = new ArrayList<IceCandidate>();
     private boolean remoteDescriptionSet;

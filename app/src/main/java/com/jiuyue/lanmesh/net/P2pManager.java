@@ -148,6 +148,11 @@ public class P2pManager {
             @Override
             public void run() {
                 java.io.InputStream in = null;
+                final WebRtcSession s = session;
+                if (s == null) {
+                    Bus.post(Bus.P2P_LOG, "发送失败：连接已关闭");
+                    return;
+                }
                 try {
                     final String fileId = java.util.UUID.randomUUID().toString();
                     in = ctx.getContentResolver().openInputStream(uri);
@@ -162,7 +167,7 @@ public class P2pManager {
                     offer.put("fileSize", size);
                     offer.put("chunkSize", P2P_CHUNK);
                     offer.put("sha256", sha);
-                    if (!session.sendFrame(Protocol.T_FILE_OFFER,
+                    if (!s.sendFrame(Protocol.T_FILE_OFFER,
                             offer.toString().getBytes("UTF-8"))) {
                         throw new IllegalStateException("发送文件请求失败");
                     }
@@ -195,7 +200,7 @@ public class P2pManager {
                         payload[2] = (byte) (idx >>> 8);
                         payload[3] = (byte) idx;
                         System.arraycopy(buf, 0, payload, 4, n);
-                        if (!session.sendFrame(Protocol.T_CHUNK, payload)) {
+                        if (!s.sendFrame(Protocol.T_CHUNK, payload)) {
                             throw new IllegalStateException("发送中断（连接已断开）");
                         }
                         sent += n;
@@ -216,7 +221,7 @@ public class P2pManager {
                     done.put("fileId", fileId);
                     done.put("sha256", sha);
                     done.put("size", size);
-                    session.sendFrame(Protocol.T_FILE_DONE, done.toString().getBytes("UTF-8"));
+                    s.sendFrame(Protocol.T_FILE_DONE, done.toString().getBytes("UTF-8"));
 
                     JSONObject res = null;
                     long waitRes = System.currentTimeMillis() + 120000;
@@ -345,6 +350,15 @@ public class P2pManager {
             if (fileId.length() == 0 || size <= 0) return;
             closeReceive();
             java.io.File dir = com.jiuyue.lanmesh.core.StorageUtil.downloadDir(ctx);
+            long free = dir.getUsableSpace();
+            if (free > 0 && free < size + 16L * 1024 * 1024) {
+                JSONObject rej = new JSONObject();
+                rej.put("fileId", fileId);
+                rej.put("reason", "存储空间不足");
+                session.sendFrame(Protocol.T_FILE_REJECT, rej.toString().getBytes("UTF-8"));
+                Bus.post(Bus.P2P_LOG, "拒绝接收 " + name + "：存储空间不足");
+                return;
+            }
             recvPart = new java.io.File(dir, ".p2p-" + fileId);
             recvTarget = com.jiuyue.lanmesh.core.Util.uniqueFile(dir, name);
             recvRaf = new java.io.RandomAccessFile(recvPart, "rw");

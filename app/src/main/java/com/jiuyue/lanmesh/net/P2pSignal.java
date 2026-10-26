@@ -69,7 +69,12 @@ public class P2pSignal {
         List<IceEntry> host4 = new ArrayList<IceEntry>();
         List<IceEntry> v6 = new ArrayList<IceEntry>();
         Set<String> seen = new HashSet<String>();
-        for (IceEntry e : ice) {
+        // ICE 候选可能还在陆续到达（10 秒兜底出码时），先快照，避免遍历中被修改
+        List<IceEntry> snapshot;
+        synchronized (this) {
+            snapshot = new ArrayList<IceEntry>(ice);
+        }
+        for (IceEntry e : snapshot) {
             if (e == null || e.candidate == null) continue;
             boolean isSrflx = e.candidate.contains(" typ srflx");
             boolean isHost = e.candidate.contains(" typ host");
@@ -133,11 +138,20 @@ public class P2pSignal {
             Deflater def = new Deflater(Deflater.BEST_COMPRESSION, true);
             def.setInput(raw);
             def.finish();
-            byte[] buf = new byte[8192];
-            int n = def.deflate(buf);
-            def.end();
-            if (n <= 0) return "";
-            return Base64.encodeToString(buf, 0, n,
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            byte[] buf = new byte[4096];
+            try {
+                while (!def.finished()) {
+                    int n = def.deflate(buf);
+                    if (n <= 0) break;
+                    out.write(buf, 0, n);
+                }
+            } finally {
+                def.end();
+            }
+            byte[] packed = out.toByteArray();
+            if (packed.length == 0) return "";
+            return Base64.encodeToString(packed,
                     Base64.URL_SAFE | Base64.NO_WRAP | Base64.NO_PADDING);
         } catch (Throwable t) {
             return "";

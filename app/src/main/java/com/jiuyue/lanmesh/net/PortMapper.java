@@ -47,15 +47,26 @@ public final class PortMapper {
 
     private PortMapper() {}
 
+    private static final java.util.concurrent.atomic.AtomicBoolean MAPPING =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
+    private static volatile Thread renewThread;
+
     public static void map(final Context ctx, final int localPort, final Callback cb) {
+        // 重复开局域网会再开一条映射，同一外部端口在路由器上直接 718 冲突
+        if (!MAPPING.compareAndSet(false, true)) {
+            cb.onResult(null, null, 0, "端口映射正在进行");
+            return;
+        }
         new Thread(new Runnable() {
             @Override
             public void run() {
+                try {
                 String natpmpError = null;
                 try {
                     Result r = tryNatPmp(ctx, localPort);
                     if (r != null) {
                         cb.onResult("NAT-PMP", r.ip, r.port, null);
+                        startRenew(ctx, localPort);
                         return;
                     }
                 } catch (Throwable t) {
@@ -66,6 +77,7 @@ public final class PortMapper {
                     Result r = tryUpnp(ctx, localPort);
                     if (r != null) {
                         cb.onResult("UPnP", r.ip, r.port, null);
+                        startRenew(ctx, localPort);
                         return;
                     }
                 } catch (Throwable t) {
@@ -74,8 +86,57 @@ public final class PortMapper {
                 }
                 cb.onResult(null, null, 0,
                         natpmpError == null ? "路由器未开启 UPnP/NAT-PMP" : natpmpError);
+                } finally {
+                    MAPPING.set(false);
+                }
             }
         }, "lanmesh-portmap").start();
+    }
+
+    /**
+     * 租期 3600 秒，但路由器常在租期过半就回收；每 1800 秒重发一次映射
+     * （AddPortMapping 同端口是幂等的），连续两次都失败就放弃。
+     */
+    private static void startRenew(final Context ctx, final int localPort) {
+        Thread old = renewThread;
+        if (old != null && old.isAlive()) return;
+        Thread t = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                while (!Thread.currentThread().isInterrupted()) {
+                    try {
+                        Thread.sleep(1800000L);
+                    } catch (InterruptedException e) {
+                        return;
+                    }
+                    boolean ok = false;
+                    for (int i = 0; i < 2 && !ok; i++) {
+                        try {
+                            Result r = tryNatPmp(ctx, localPort);
+                            if (r == null) r = tryUpnp(ctx, localPort);
+                            ok = r != null;
+                        } catch (Throwable t2) {
+                            Log.w(TAG, "renew failed", t2);
+                        }
+                    }
+                    if (!ok) {
+                        Log.w(TAG, "port mapping renewal gave up");
+                        return;
+                    }
+                }
+            }
+        }, "lanmesh-portmap-renew");
+        t.setDaemon(true);
+        renewThread = t;
+        t.start();
+    }
+
+    /** 关闭局域网时停止续约。 */
+    public static void stopRenew() {
+        Thread t = renewThread;
+        renewThread = null;
+        if (t != null) t.interrupt();
+        MAPPING.set(false);
     }
 
     private static class Result {
@@ -96,10 +157,23 @@ public final class PortMapper {
             socket.send(new DatagramPacket(req, req.length, new InetSocketAddress(gw, 5351)));
             byte[] buf = new byte[32];
             DatagramPacket p = new DatagramPacket(buf, buf.length);
-            socket.receive(p);
-            if (p.getLength() < 12 || buf[1] != (byte) 128 || buf[2] != 0) return null;
+            // 只接受来自网关 5351 的应答：同网段任何主机都能抢先伪造一个外部 IP
+            long until = System.currentTimeMillis() + 2000;
+            while (true) {
+                if (System.currentTimeMillis() > until) return null;
+                p.setLength(buf.length);
+                socket.receive(p);
+                if (!gw.equals(p.getAddress()) || p.getPort() != 5351) continue;
+                if (p.getLength() >= 12 && buf[1] == (byte) 128 && buf[2] == 0) break;
+                return null;
+            }
             String externalIp = (buf[8] & 0xFF) + "." + (buf[9] & 0xFF) + "."
                     + (buf[10] & 0xFF) + "." + (buf[11] & 0xFF);
+            // RFC 6886：0.0.0.0 表示"公网地址与本机相同"，不能当作可用外部地址
+            if ("0.0.0.0".equals(externalIp)) {
+                Log.i(TAG, "natpmp reports 0.0.0.0, no NAT");
+                return null;
+            }
 
             // 2) 映射 TCP 端口（opcode 2）
             byte[] m = new byte[12];
@@ -134,6 +208,25 @@ public final class PortMapper {
     }
 
     private static InetAddress gateway(Context ctx) {
+        // API 23+ 走默认路由：Wi-Fi / 以太网 / 热点 / USB 共享都能拿到网关，
+        // DhcpInfo 只有 Wi-Fi 有，其余场景会静默返回 null（NAT-PMP 直接放弃）
+        if (android.os.Build.VERSION.SDK_INT >= 23) {
+            try {
+                android.net.ConnectivityManager cm =
+                        (android.net.ConnectivityManager) ctx.getSystemService(Context.CONNECTIVITY_SERVICE);
+                android.net.Network n = cm == null ? null : cm.getActiveNetwork();
+                android.net.LinkProperties lp = n == null ? null : cm.getLinkProperties(n);
+                if (lp != null) {
+                    for (android.net.RouteInfo r : lp.getRoutes()) {
+                        if (r.isDefaultRoute() && r.getGateway() != null
+                                && !r.getGateway().isAnyLocalAddress()) {
+                            return r.getGateway();
+                        }
+                    }
+                }
+            } catch (Throwable ignored) {
+            }
+        }
         try {
             WifiManager wm = (WifiManager) ctx.getApplicationContext()
                     .getSystemService(Context.WIFI_SERVICE);
@@ -167,23 +260,34 @@ public final class PortMapper {
                 String externalIp = match(ip, "<NewExternalIPAddress>(.*?)</NewExternalIPAddress>");
                 if (externalIp == null || externalIp.length() == 0) continue;
 
-                String body = "<u:AddPortMapping xmlns:u=\"" + serviceType + "\">"
-                        + "<NewRemoteHost></NewRemoteHost>"
-                        + "<NewExternalPort>" + localPort + "</NewExternalPort>"
-                        + "<NewProtocol>TCP</NewProtocol>"
-                        + "<NewInternalPort>" + localPort + "</NewInternalPort>"
-                        + "<NewInternalClient>" + localIp() + "</NewInternalClient>"
-                        + "<NewEnabled>1</NewEnabled>"
-                        + "<NewPortMappingDescription>LanMesh</NewPortMappingDescription>"
-                        + "<NewLeaseDuration>3600</NewLeaseDuration>"
-                        + "</u:AddPortMapping>";
-                String resp = soap(fullControl, serviceType, body);
-                if (resp != null) {
-                    Result r = new Result();
-                    r.ip = externalIp;
-                    r.port = localPort;
-                    Log.i(TAG, "UPnP mapped " + externalIp + ":" + localPort);
-                    return r;
+                String internalIp = localIp(ctx);
+                if (internalIp == null || internalIp.length() == 0
+                        || "null".equals(internalIp)) {
+                    continue;
+                }
+                // 先试随机外部端口：默认端口 45900 是全部设备共用的，
+                // 同一局域网第二台设备必然拿到 718 ConflictInMappingEntry
+                int[] candidates = {randomExternalPort(), localPort, randomExternalPort()};
+                for (int extPort : candidates) {
+                    String body = "<u:AddPortMapping xmlns:u=\"" + serviceType + "\">"
+                            + "<NewRemoteHost></NewRemoteHost>"
+                            + "<NewExternalPort>" + extPort + "</NewExternalPort>"
+                            + "<NewProtocol>TCP</NewProtocol>"
+                            + "<NewInternalPort>" + localPort + "</NewInternalPort>"
+                            + "<NewInternalClient>" + internalIp + "</NewInternalClient>"
+                            + "<NewEnabled>1</NewEnabled>"
+                            + "<NewPortMappingDescription>LanMesh-" + localPort + "</NewPortMappingDescription>"
+                            + "<NewLeaseDuration>3600</NewLeaseDuration>"
+                            + "</u:AddPortMapping>";
+                    String resp = soap(fullControl, serviceType, body);
+                    if (resp != null) {
+                        Result r = new Result();
+                        r.ip = externalIp;
+                        r.port = extPort;
+                        Log.i(TAG, "UPnP mapped " + externalIp + ":" + extPort
+                                + " -> " + internalIp + ":" + localPort);
+                        return r;
+                    }
                 }
             } catch (Throwable t) {
                 Log.w(TAG, "upnp try " + location + " failed: " + t.getMessage());
@@ -215,7 +319,7 @@ public final class PortMapper {
             String msg = "M-SEARCH * HTTP/1.1\r\n"
                     + "HOST: 239.255.255.250:1900\r\n"
                     + "MAN: \"ssdp:discover\"\r\n"
-                    + "MX: 2\r\n"
+                    + "MX: 1\r\n"
                     + "ST: urn:schemas-upnp-org:device:InternetGatewayDevice:1\r\n\r\n";
             byte[] data = msg.getBytes("UTF-8");
             InetAddress group = InetAddress.getByName("239.255.255.250");
@@ -320,7 +424,14 @@ public final class PortMapper {
         ByteArrayOutputStream out = new ByteArrayOutputStream();
         byte[] buf = new byte[4096];
         int n;
-        while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+        long total = 0;
+        while ((n = in.read(buf)) > 0) {
+            total += n;
+            if (total > 512 * 1024) {
+                throw new IllegalStateException("response too large");
+            }
+            out.write(buf, 0, n);
+        }
         in.close();
         return new String(out.toByteArray(), "UTF-8");
     }
@@ -346,7 +457,15 @@ public final class PortMapper {
         return m.find() ? m.group(1).trim() : null;
     }
 
-    private static String localIp() {
-        return com.jiuyue.lanmesh.core.Util.localIpv4(null);
+    private static String localIp(Context ctx) {
+        // 必须传 ctx：不传会走网卡遍历兜底，多网卡（Wi-Fi + 热点）时可能取到另一张网卡的地址，
+        // 路由器照样返回 200，但外部访问进不来（"假成功"）
+        return com.jiuyue.lanmesh.core.Util.localIpv4(ctx);
+    }
+
+    private static final java.util.Random RND = new java.util.Random();
+
+    private static int randomExternalPort() {
+        return 40000 + RND.nextInt(20000);
     }
 }

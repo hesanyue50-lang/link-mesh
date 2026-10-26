@@ -408,30 +408,31 @@ public class ChatActivity extends AppCompatActivity implements Bus.Listener {
         if (localPath == null && uri != null && tree != null && tree.length() > 0) {
             Ui.toast(this, "正在复制到公共文件夹…");
             final Uri src = uri;
+            // 复制大文件要几十秒，期间用户可能切到别的会话：目标必须锁定
+            final Peer target = peer;
             new Thread(new Runnable() {
                 @Override
                 public void run() {
                     final String copied = com.jiuyue.lanmesh.core.PublicCopy.copyToTree(
                             ChatActivity.this, tree, src, m.fileName);
+                    // 复制失败分支也不能在主线程做 IO
+                    final String local = copied != null ? null : copyToPrivate(src, m.fileName);
                     runOnUiThread(new Runnable() {
                         @Override
                         public void run() {
                             if (copied != null) {
                                 m.localPath = copied;
                                 core.messages.update(m);
-                                s.sendFile(peer, m, Uri.parse(copied), null);
-                            } else {
+                                s.sendFile(target, m, Uri.parse(copied), null);
+                            } else if (local != null) {
                                 // 公共目录复制失败：至少在本机留一份，否则发送方之后打不开
-                                String local = copyToPrivate(src, m.fileName);
-                                if (local != null) {
-                                    m.localPath = local;
-                                    core.messages.update(m);
-                                    Ui.toast(ChatActivity.this, "公共文件夹不可写，已保存到 App 内并发送");
-                                    s.sendFile(peer, m, src, local);
-                                } else {
-                                    Ui.toast(ChatActivity.this, "复制失败，改为直接发送");
-                                    s.sendFile(peer, m, src, null);
-                                }
+                                m.localPath = local;
+                                core.messages.update(m);
+                                Ui.toast(ChatActivity.this, "公共文件夹不可写，已保存到 App 内并发送");
+                                s.sendFile(target, m, src, local);
+                            } else {
+                                Ui.toast(ChatActivity.this, "复制失败，改为直接发送");
+                                s.sendFile(target, m, src, null);
                             }
                         }
                     });
@@ -526,12 +527,11 @@ public class ChatActivity extends AppCompatActivity implements Bus.Listener {
         for (ChatMessage m : core.messages.load(peer.deviceId)) {
             try {
                 if (m.localPath == null || m.localPath.length() == 0) continue;
-                if (m.localPath.startsWith("content://")) {
-                    getContentResolver().delete(Uri.parse(m.localPath), null, null);
-                } else {
-                    File f = new File(m.localPath);
-                    if (f.isFile()) f.delete();
-                }
+                // 公共文件夹（content://）里的副本不动：那是用户能看到的文件，
+                // 清聊天记录顺手删掉等于悄悄删用户资料
+                if (m.localPath.startsWith("content://")) continue;
+                File f = new File(m.localPath);
+                if (f.isFile()) f.delete();
             } catch (Throwable ignored) {
             }
         }
