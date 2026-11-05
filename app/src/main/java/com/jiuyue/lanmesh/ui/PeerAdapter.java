@@ -79,12 +79,18 @@ public class PeerAdapter extends BaseAdapter {
         String src;
         if (Peer.SRC_NSD.equals(p.source)) src = "NSD";
         else if (Peer.SRC_MULTICAST.equals(p.source)) src = "组播";
+        else if (Peer.SRC_MEMORY.equals(p.source)) src = "上次连过";
+        else if (Peer.SRC_LOCALSEND.equals(p.source)) src = "LocalSend";
         else src = "手动";
         h.sub.setText(p.shortId() + "  " + p.address() + "  " + src);
 
         if (!online) {
             h.badge.setText(R.string.conn_offline);
             h.badge.setTextColor(ctx.getResources().getColor(R.color.text_faint));
+        } else if (p.isLocalSend()) {
+            // LocalSend 没有"信任"这一层，标成待确认会误导用户去等确认
+            h.badge.setText("LocalSend");
+            h.badge.setTextColor(ctx.getResources().getColor(R.color.accent));
         } else if (!p.trusted) {
             h.badge.setText("待确认");
             h.badge.setTextColor(ctx.getResources().getColor(R.color.warn));

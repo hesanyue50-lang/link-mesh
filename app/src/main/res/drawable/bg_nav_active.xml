@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!-- 选中滑块：内径 54dp，圆角取半高 -->
 <shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
     <solid android:color="@color/panel_hi" />
-    <corners android:radius="22dp" />
+    <corners android:radius="27dp" />
 </shape>

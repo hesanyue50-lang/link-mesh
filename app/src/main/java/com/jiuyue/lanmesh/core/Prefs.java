@@ -149,6 +149,44 @@ public class Prefs {
         sp.edit().putString(K_SAVE_TREE, uri == null ? "" : uri).apply();
     }
 
+    /**
+     * 网页端发来的文字是否自动进手机剪贴板。
+     * 默认关：局域网内任何人都能打开网页端并 POST /text，开着等于把剪贴板控制权交出去。
+     */
+    public boolean autoClipFromWeb() {
+        return sp.getBoolean("auto_clip_web", false);
+    }
+
+    public void setAutoClipFromWeb(boolean on) {
+        sp.edit().putBoolean("auto_clip_web", on).apply();
+    }
+
+    /** 传输加密开关。默认关：开启后要求双方口令一致，老版本对端会被拒绝。 */
+    public boolean encEnabled() {
+        return sp.getBoolean("enc_enabled", false);
+    }
+
+    public void setEncEnabled(boolean on) {
+        sp.edit().putBoolean("enc_enabled", on).apply();
+    }
+
+    public String encPass() {
+        return sp.getString("enc_pass", "");
+    }
+
+    public void setEncPass(String pass) {
+        sp.edit().putString("enc_pass", pass == null ? "" : pass).apply();
+    }
+
+    /** 最近连过的设备（JSON），进程被杀后用来撑起列表，不必干等发现。 */
+    public String rememberedPeers() {
+        return sp.getString("remembered_peers", "");
+    }
+
+    public void setRememberedPeers(String json) {
+        sp.edit().putString("remembered_peers", json == null ? "" : json).apply();
+    }
+
     public boolean lanEnabled() {
         return sp.getBoolean(K_LAN_ENABLED, true);
     }

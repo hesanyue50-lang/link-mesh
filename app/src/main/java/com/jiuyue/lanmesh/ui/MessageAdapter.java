@@ -147,7 +147,7 @@ public class MessageAdapter extends BaseAdapter {
                     || ChatMessage.ST_RECEIVING.equals(m.status) || pausedState;
             h.progress.setVisibility(running || ChatMessage.ST_DONE.equals(m.status)
                     ? View.VISIBLE : View.GONE);
-            h.progress.setProgress(m.progress);
+            h.progress.setProgress(m.progress < 0 ? 0 : m.progress);
 
             final ChatMessage fm = m;
             h.fileActions.setVisibility(running ? View.VISIBLE : View.GONE);
@@ -204,8 +204,12 @@ public class MessageAdapter extends BaseAdapter {
                 h.fileStatus.setText(R.string.file_cancelled);
             } else {
                 h.fileStatus.setTextColor(ctx.getResources().getColor(R.color.text_dim));
-                String speed = m.speed > 0 ? Util.humanSpeed(m.speed) : "…";
-                h.fileStatus.setText(m.progress + "%  " + speed);
+                if (m.progress < 0) {
+                    h.fileStatus.setText("计算校验…");
+                } else {
+                    String speed = m.speed > 0 ? Util.humanSpeed(m.speed) : "…";
+                    h.fileStatus.setText(m.progress + "%  " + speed);
+                }
             }
         } else {
             h.fileBox.setVisibility(View.GONE);

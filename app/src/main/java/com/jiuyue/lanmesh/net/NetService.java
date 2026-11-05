@@ -765,9 +765,10 @@ public class NetService extends Service {
             hello.put("deviceId", prefs.deviceId());
             hello.put("nickname", prefs.nickname());
             hello.put("port", port);
+            String myNonce = EncHandshake.attach(hello, prefs);
             writer.writeJson(Protocol.T_HELLO, hello);
 
-            if (!transfer.handshake(reader, writer, peer)) {
+            if (!transfer.handshake(reader, writer, peer, myNonce)) {
                 throw new IllegalStateException("对方未确认连接");
             }
 
@@ -840,6 +841,7 @@ public class NetService extends Service {
                     hello.put("deviceId", prefs.deviceId());
                     hello.put("nickname", prefs.nickname());
                     hello.put("port", port);
+                    final String myNonce = EncHandshake.attach(hello, prefs);
                     writer.writeJson(Protocol.T_HELLO, hello);
 
                     long deadline = System.currentTimeMillis() + Const.TRUST_WAIT_MS + 5000;
@@ -851,6 +853,20 @@ public class NetService extends Service {
                         }
                         if (f.type == Protocol.T_HELLO_ACK) {
                             JSONObject o = f.json();
+                            if (!o.optBoolean("ok", true)) {
+                                error = o.optString("reason", "对方拒绝连接");
+                                break;
+                            }
+                            try {
+                                Protocol.Secure sec = EncHandshake.build(o, myNonce, prefs);
+                                if (sec != null) {
+                                    writer.setSecure(sec);
+                                    reader.setSecure(sec);
+                                }
+                            } catch (Exception enc) {
+                                error = EncHandshake.why(enc);
+                                break;
+                            }
                             String did = o.optString("deviceId", "");
                             if (did.length() >= 8) {
                                 peers.upsert(did, o.optString("nickname", ""), host, p, Peer.SRC_MANUAL);

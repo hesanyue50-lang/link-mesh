@@ -49,6 +49,8 @@ public class MainActivity extends AppCompatActivity implements Bus.Listener {
     private static final int REQ_TREE = 4401;
     private static final int REQ_P2P_FILE = 4402;
     private static final int REQ_SCAN_ANSWER = 4302;
+    /** 扫"局域网直连"二维码 */
+    private static final int REQ_SCAN_LAN = 4503;
     private static final int REQ_CAMERA = 4303;
     private boolean pendingScanAnswer = false;
     private static final String STATE_TAB = "current_tab";
@@ -114,6 +116,10 @@ public class MainActivity extends AppCompatActivity implements Bus.Listener {
     private TextView tvAddress;
     private TextView tvAbout;
     private com.jiuyue.lanmesh.ui.AnimSwitch swAutoAccept;
+    private com.jiuyue.lanmesh.ui.AnimSwitch swEnc;
+    private com.jiuyue.lanmesh.ui.AnimSwitch swAutoClip;
+    private TextView tvEncPass;
+    private boolean updatingEnc;
     private boolean updatingAutoAccept = false;
     private TextView tvDownloadHint;
     private TextView tvSaveTree;
@@ -132,6 +138,17 @@ public class MainActivity extends AppCompatActivity implements Bus.Listener {
     private boolean trustShowing = false;
     private String cachedIp;
     private String cachedTreeUriForName;
+    /** LocalSend 列表没有 TTL 推送，靠定时 sync + 自己周期性 announce 维持 */
+    private final android.os.Handler lsTickHandler = new android.os.Handler(android.os.Looper.getMainLooper());
+    private final Runnable lsTick = new Runnable() {
+        @Override
+        public void run() {
+            syncLsPeers();
+            com.jiuyue.lanmesh.net.ls.LsDiscovery d = core.lsDiscovery();
+            if (d != null) d.announce();
+            lsTickHandler.postDelayed(this, 45000);
+        }
+    };
     private String cachedTreeName;
     private static boolean notifAsked = false;
 
@@ -144,6 +161,7 @@ public class MainActivity extends AppCompatActivity implements Bus.Listener {
 
         bindViews();
         Ui.applyEdgeToEdge(this, findViewById(R.id.main_root));
+        setupFloatingNav();
         Ui.letterSpacing((TextView) findViewById(R.id.tv_own_id), 0.02f);
 
         // 冷启动一律回局域网；只有同一进程内的 recreate（主题切换）才沿用原页。
@@ -174,6 +192,8 @@ public class MainActivity extends AppCompatActivity implements Bus.Listener {
 
         if (currentTab == TAB_P2P && Build.VERSION.SDK_INT < Const.MIN_P2P_API) currentTab = TAB_LAN;
         ensureService();
+        ensureLsDiscovery();
+        lsTickHandler.postDelayed(lsTick, 15000);
         refresh();
         refreshSettings();
 
@@ -202,12 +222,107 @@ public class MainActivity extends AppCompatActivity implements Bus.Listener {
         }
     }
 
+    /**
+     * 悬浮导航：胶囊抬离内容（elevation）+ 内容底部避让。
+     * 页面是全屏铺的，导航叠在上面，所以必须给滚动容器留出被遮住的高度，
+     * 否则最后一条永远滚不出来。
+     */
+    /**
+     * 把手机当前剪贴板推给网页端（电脑上直接粘贴）。
+     * 只在用户主动点击时读剪贴板——不做后台读取，也不给网页任何读取入口。
+     */
+    private void sendClipboardToWeb() {
+        String text = null;
+        try {
+            android.content.ClipboardManager cm = (android.content.ClipboardManager)
+                    getSystemService(android.content.Context.CLIPBOARD_SERVICE);
+            if (cm != null && cm.hasPrimaryClip()) {
+                android.content.ClipData clip = cm.getPrimaryClip();
+                if (clip != null && clip.getItemCount() > 0) {
+                    CharSequence cs = clip.getItemAt(0).coerceToText(this);
+                    if (cs != null) text = cs.toString().trim();
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        if (text == null || text.length() == 0) {
+            Ui.toast(this, "剪贴板是空的");
+            return;
+        }
+        if (text.length() > 8000) text = text.substring(0, 8000);
+        try {
+            com.jiuyue.lanmesh.model.ChatMessage m = new com.jiuyue.lanmesh.model.ChatMessage();
+            m.peerDeviceId = "web-sync"; // 聚合进所有网页访客的会话，网页端 2.5 秒轮询能看到
+            m.direction = com.jiuyue.lanmesh.model.ChatMessage.DIR_OUT;
+            m.type = com.jiuyue.lanmesh.model.ChatMessage.TYPE_TEXT;
+            m.text = text;
+            m.status = com.jiuyue.lanmesh.model.ChatMessage.ST_SENT;
+            core.messages.append(m);
+            Ui.toast(this, "已发到网页端");
+            refresh();
+        } catch (Throwable t) {
+            Ui.toast(this, "发送失败");
+        }
+    }
+
+    private void setupFloatingNav() {
+        final android.view.View seg = findViewById(R.id.seg_wrap);
+        final android.view.View nav = findViewById(R.id.nav_container);
+        if (seg == null || nav == null) return;
+
+        // 不加 elevation：胶囊是半圆轮廓，系统阴影会在左右两个圆弧上堆成一坨，
+        // 直边处又几乎没有，看起来像两只角挂着黑影。分离感交给 1dp 描边 + 下方淡出层。
+        if (Build.VERSION.SDK_INT >= 21) {
+            seg.setElevation(0f);
+        }
+
+        nav.post(new Runnable() {
+            @Override
+            public void run() {
+                int used = seg.getHeight() + nav.getPaddingTop() + nav.getPaddingBottom();
+                applyContentBottomInset(used + Ui.dp(MainActivity.this, 8));
+            }
+        });
+    }
+
+    /**
+     * 页面是全屏铺的，导航叠在上面。分两种情况：
+     * - 局域网页是 LinearLayout，底部贴着「手动添加」按钮 → 抬页面根布局，列表不用留白；
+     * - P2P / 设置页是 ScrollView → 留白加在滚动容器上，内容能从胶囊下面滚过去。
+     */
+    private void applyContentBottomInset(int px) {
+        android.view.View lan = findViewById(R.id.page_lan);
+        if (lan != null) {
+            lan.setPadding(lan.getPaddingLeft(), lan.getPaddingTop(),
+                    lan.getPaddingRight(), px);
+        }
+        int[] scrollPages = new int[]{R.id.page_p2p, R.id.page_settings};
+        for (int id : scrollPages) {
+            android.view.View sv = findViewById(id);
+            if (sv == null) continue;
+            if (sv instanceof android.view.ViewGroup) {
+                ((android.view.ViewGroup) sv).setClipToPadding(false);
+            }
+            sv.setPadding(sv.getPaddingLeft(), sv.getPaddingTop(),
+                    sv.getPaddingRight(), px);
+        }
+    }
+
     private void bindViews() {
         tvOwnId = (TextView) findViewById(R.id.tv_own_id);
         tvEmpty = (TextView) findViewById(R.id.tv_empty);
         tvDiag = (TextView) findViewById(R.id.tv_diag);
         tvWebUrl = (TextView) findViewById(R.id.tv_web_url);
         btnOpenWeb = (TextView) findViewById(R.id.btn_open_web);
+        android.view.View btnClip = findViewById(R.id.btn_clip);
+        if (btnClip != null) {
+            btnClip.setOnClickListener(new View.OnClickListener() {
+                @Override
+                public void onClick(View v) {
+                    sendClipboardToWeb();
+                }
+            });
+        }
         btnWebToggle = (ImageView) findViewById(R.id.btn_web_toggle);
         webToggleColor = getResources().getColor(R.color.accent);
         tvCount = (TextView) findViewById(R.id.tv_count);
@@ -300,7 +415,7 @@ public class MainActivity extends AppCompatActivity implements Bus.Listener {
         findViewById(R.id.btn_manual).setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
-                manualAdd();
+                manualMenu();
             }
         });
         Ui.pressable(findViewById(R.id.btn_manual));
@@ -616,6 +731,42 @@ public class MainActivity extends AppCompatActivity implements Bus.Listener {
                 chooseSaveTree();
             }
         });
+        swAutoClip = (com.jiuyue.lanmesh.ui.AnimSwitch) findViewById(R.id.sw_auto_clip);
+        android.view.View rowAutoClip = findViewById(R.id.row_auto_clip);
+        if (rowAutoClip != null && swAutoClip != null) {
+            rowAutoClip.setOnClickListener(new View.OnClickListener() {
+                @Override
+                public void onClick(View v) {
+                    boolean on = !core.prefs.autoClipFromWeb();
+                    core.prefs.setAutoClipFromWeb(on);
+                    swAutoClip.setChecked(on);
+                    Ui.toast(MainActivity.this, on
+                            ? "网页消息会自动复制到剪贴板"
+                            : "已关闭：网页消息不再改剪贴板");
+                }
+            });
+        }
+        swEnc = (com.jiuyue.lanmesh.ui.AnimSwitch) findViewById(R.id.sw_enc);
+        tvEncPass = (TextView) findViewById(R.id.tv_enc_pass);
+        android.view.View rowEnc = findViewById(R.id.row_enc);
+        if (rowEnc != null && swEnc != null) {
+            rowEnc.setOnClickListener(new View.OnClickListener() {
+                @Override
+                public void onClick(View v) {
+                    toggleEncryption();
+                }
+            });
+        }
+        android.view.View rowEncPass = findViewById(R.id.row_enc_pass);
+        if (rowEncPass != null) {
+            rowEncPass.setOnClickListener(new View.OnClickListener() {
+                @Override
+                public void onClick(View v) {
+                    editEncPass();
+                }
+            });
+        }
+
         findViewById(R.id.row_auto_accept).setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
@@ -1146,7 +1297,86 @@ public class MainActivity extends AppCompatActivity implements Bus.Listener {
         Ui.toast(this, "无法打开文件管理器：" + abs);
     }
 
+    // ---------------- 传输加密 ----------------
+
+    private void toggleEncryption() {
+        if (updatingEnc) return;
+        final boolean want = !core.prefs.encEnabled();
+        if (want) {
+            String pass = core.prefs.encPass();
+            if (pass == null || pass.trim().length() < 4) {
+                Ui.toast(this, "先设置一个至少 4 位的口令");
+                editEncPass();
+                return;
+            }
+            new androidx.appcompat.app.AlertDialog.Builder(this)
+                    .setTitle("开启传输加密")
+                    .setMessage("两台设备必须填写相同口令，否则连不上。"
+                            + "对方使用旧版本时会拒绝连接，不会退回明文。")
+                    .setNegativeButton("取消", null)
+                    .setPositiveButton("开启", new android.content.DialogInterface.OnClickListener() {
+                        @Override
+                        public void onClick(android.content.DialogInterface d, int which) {
+                            core.prefs.setEncEnabled(true);
+                            updateDownloadSettings();
+                            Ui.toast(MainActivity.this, "传输加密已开启");
+                        }
+                    })
+                    .show();
+            return;
+        }
+        core.prefs.setEncEnabled(false);
+        updateDownloadSettings();
+        Ui.toast(this, "传输加密已关闭，之后的连接为明文");
+    }
+
+    private void editEncPass() {
+        final String cur = core.prefs.encPass();
+        Ui.input(this, "加密口令（至少 4 位）", "两台设备填一样的口令", cur == null ? "" : cur,
+                new Ui.OnText() {
+                    @Override
+                    public void onText(String text) {
+                        String v = text == null ? "" : text.trim();
+                        if (v.length() == 0) {
+                            core.prefs.setEncPass("");
+                            core.prefs.setEncEnabled(false);
+                            updateDownloadSettings();
+                            Ui.toast(MainActivity.this, "口令已清空，加密关闭");
+                            return;
+                        }
+                        if (v.length() < 4) {
+                            Ui.toast(MainActivity.this, "口令至少 4 位");
+                            return;
+                        }
+                        core.prefs.setEncPass(v);
+                        updateDownloadSettings();
+                        Ui.toast(MainActivity.this, "口令已保存，另一台设备也要填相同口令");
+                    }
+                });
+    }
+
+    private void updateEncryptionSettings() {
+        if (swEnc != null) {
+            updatingEnc = true;
+            swEnc.setChecked(core.prefs.encEnabled());
+            updatingEnc = false;
+        }
+        if (swAutoClip != null) {
+            swAutoClip.setChecked(core.prefs.autoClipFromWeb());
+        }
+        if (tvEncPass != null) {
+            String p = core.prefs.encPass();
+            if (p == null || p.length() == 0) {
+                tvEncPass.setText("未设置");
+            } else {
+                // 只显示位数，不显示口令本身，避免截图泄露
+                tvEncPass.setText(p.length() + " 位");
+            }
+        }
+    }
+
     private void updateDownloadSettings() {
+        updateEncryptionSettings();
         if (swAutoAccept != null) {
             updatingAutoAccept = true;
             swAutoAccept.setChecked(core.prefs.autoAcceptFiles());
@@ -1545,6 +1775,7 @@ public class MainActivity extends AppCompatActivity implements Bus.Listener {
     @Override
     protected void onPause() {
         Bus.unregister(this);
+        lsTickHandler.removeCallbacks(lsTick);
         dismissSignalDialog(); // 旋转/切后台：不让 Dialog 挂在已销毁的 Activity 上
         super.onPause();
     }
@@ -1557,6 +1788,114 @@ public class MainActivity extends AppCompatActivity implements Bus.Listener {
             themeAnim = null;
         }
         super.onDestroy();
+    }
+
+    /** LocalSend 发现：加入 224.0.0.167:53317，把对端并进设备列表。 */
+    private void ensureLsDiscovery() {
+        if (core.lsDiscovery() != null) {
+            syncLsPeers();
+            return;
+        }
+        try {
+            com.jiuyue.lanmesh.net.ls.LsDiscovery d =
+                    new com.jiuyue.lanmesh.net.ls.LsDiscovery(this,
+                            new com.jiuyue.lanmesh.net.ls.LsDiscovery.Listener() {
+                                @Override
+                                public void onDevicesChanged() {
+                                    runOnUiThread(new Runnable() {
+                                        @Override
+                                        public void run() {
+                                            syncLsPeers();
+                                        }
+                                    });
+                                }
+
+                                @Override
+                                public void onAnnounceWanted() {
+                                    com.jiuyue.lanmesh.net.ls.LsDiscovery x = core.lsDiscovery();
+                                    if (x != null) x.announce();
+                                }
+                            });
+            core.attachLsDiscovery(d);
+            d.start();
+            d.announce();
+            startLsServer();
+        } catch (Throwable t) {
+            android.util.Log.w("LanMeshUI", "ls discovery failed", t);
+        }
+    }
+
+    /** LocalSend 接收端：在 53317 上提供 v2 API，官方客户端可以直接传给我们。 */
+    private void startLsServer() {
+        if (core.lsServer() != null) return;
+        try {
+            com.jiuyue.lanmesh.net.ls.LsServer sv =
+                    new com.jiuyue.lanmesh.net.ls.LsServer(this,
+                            new com.jiuyue.lanmesh.net.ls.LsServer.Callback() {
+                                @Override
+                                public void onFileReceived(String alias, String remoteIp,
+                                                           String fileName, long size,
+                                                           java.io.File saved, String error) {
+                                    handleLsIncoming(remoteIp, fileName, size, saved, error);
+                                }
+                            });
+            core.attachLsServer(sv);
+            sv.start();
+        } catch (Throwable t) {
+            android.util.Log.w("LanMeshUI", "ls server failed", t);
+        }
+    }
+
+    private void handleLsIncoming(String remoteIp, String fileName, long size,
+                                  java.io.File saved, String error) {
+        try {
+            if (error != null) {
+                Bus.toast("LocalSend: " + error);
+                return;
+            }
+            String pid = null;
+            com.jiuyue.lanmesh.net.ls.LsDiscovery d = core.lsDiscovery();
+            if (d != null) {
+                for (com.jiuyue.lanmesh.net.ls.LsDevice dev : d.snapshot()) {
+                    if (dev.host != null && dev.host.equals(remoteIp)) {
+                        pid = Peer.LS_PREFIX + dev.fingerprint;
+                        break;
+                    }
+                }
+            }
+            if (pid == null || core.peers.get(pid) == null) {
+                // 对方只发了文件但还没被我们发现：不硬造会话，否则聊天页会打开一个空壳
+                Bus.toast("收到 " + fileName + (saved == null ? "" : "（" + saved.getParent() + "）"));
+                return;
+            }
+            com.jiuyue.lanmesh.model.ChatMessage m = new com.jiuyue.lanmesh.model.ChatMessage();
+            m.peerDeviceId = pid;
+            m.direction = com.jiuyue.lanmesh.model.ChatMessage.DIR_IN;
+            m.type = com.jiuyue.lanmesh.model.ChatMessage.TYPE_FILE;
+            m.fileId = java.util.UUID.randomUUID().toString();
+            m.fileName = fileName;
+            m.fileSize = size;
+            m.localPath = saved == null ? null : saved.getAbsolutePath();
+            m.status = com.jiuyue.lanmesh.model.ChatMessage.ST_DONE;
+            m.progress = 100;
+            m.transferMode = "localsend";
+            core.messages.append(m);
+            Bus.toast("收到 " + fileName + (saved == null ? "" : "  " + saved.getParent()));
+            refresh();
+        } catch (Throwable t) {
+            android.util.Log.w("LanMeshUI", "ls incoming failed", t);
+        }
+    }
+
+    private void syncLsPeers() {
+        com.jiuyue.lanmesh.net.ls.LsDiscovery d = core.lsDiscovery();
+        if (d == null) return;
+        boolean changed = false;
+        for (com.jiuyue.lanmesh.net.ls.LsDevice dev : d.snapshot()) {
+            changed |= core.peers.upsert(Peer.LS_PREFIX + dev.fingerprint,
+                    dev.displayName(), dev.host, dev.port, Peer.SRC_LOCALSEND);
+        }
+        if (changed) refresh();
     }
 
     private void ensureService() {
@@ -1668,13 +2007,17 @@ public class MainActivity extends AppCompatActivity implements Bus.Listener {
     private void refresh() {
         List<Peer> peers = core.peers.list();
         adapter.setData(peers);
+        long nowMs = System.currentTimeMillis();
+        int online = 0;
+        for (Peer p : peers) if (p.isOnline(nowMs)) online++;
         tvOwnId.setText(core.prefs.shortId() + "  " + core.prefs.nickname());
-        tvCount.setText(getString(R.string.nearby_count, peers.size()));
+        tvCount.setText(getString(R.string.nearby_count, online));
         NetService s = core.service();
         int port = s == null ? 0 : s.getPort();
         String mode = s == null ? "服务未启动" : "发现中";
         tvDiag.setText((cachedIp == null ? "无 Wi-Fi 地址" : cachedIp + ":" + port)
-                + "  ·  " + peers.size() + " 台  ·  " + mode + "  ·  长按复制诊断");
+                + "  ·  " + online + " 台（" + peers.size() + " 已记录）  ·  " + mode
+                + "  ·  长按复制诊断");
         boolean webOn = isWebRunning();
         if (lastWebOn == null || lastWebOn.booleanValue() != webOn) {
             updateWebToggle(webOn, lastWebOn != null);
@@ -1709,6 +2052,112 @@ public class MainActivity extends AppCompatActivity implements Bus.Listener {
                         refreshSettings();
                     }
                 });
+    }
+
+    /** 一个按钮承载三种添加入口：输地址 / 扫对方 / 给对方扫。 */
+    private void manualMenu() {
+        String[] items = new String[]{"输入 IP 地址", "扫描对方二维码", "显示我的二维码"};
+        new androidx.appcompat.app.AlertDialog.Builder(this)
+                .setTitle("添加设备")
+                .setItems(items, new android.content.DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(android.content.DialogInterface d, int which) {
+                        if (which == 0) {
+                            manualAdd();
+                        } else if (which == 1) {
+                            launchLanScanner();
+                        } else {
+                            showMyQrCode();
+                        }
+                    }
+                })
+                .show();
+    }
+
+    private void launchLanScanner() {
+        try {
+            com.google.zxing.integration.android.IntentIntegrator integrator =
+                    new com.google.zxing.integration.android.IntentIntegrator(this);
+            integrator.setDesiredBarcodeFormats(
+                    com.google.zxing.integration.android.IntentIntegrator.QR_CODE);
+            integrator.setPrompt("");
+            integrator.setBeepEnabled(false);
+            integrator.setOrientationLocked(false);
+            integrator.setCaptureActivity(QrScanActivity.class);
+            startActivityForResult(integrator.createScanIntent(), REQ_SCAN_LAN);
+        } catch (Throwable t) {
+            Ui.toast(this, "无法启动扫码: " + t.getMessage());
+        }
+    }
+
+    /** 我的连接二维码：内容 lm1|deviceId|ip|port|昵称，对方扫完直接进聊天，不用等发现。 */
+    private void showMyQrCode() {
+        NetService svc = core.service();
+        int port = svc == null ? 0 : svc.getPort();
+        final String ip = cachedIp != null ? cachedIp : Util.localIpv4(this);
+        if (port <= 0 || ip == null) {
+            Ui.toast(this, "服务未启动，先打开局域网传输");
+            return;
+        }
+        final String payload = "lm1|" + core.prefs.deviceId() + "|" + ip + "|" + port
+                + "|" + core.prefs.nickname();
+        final android.widget.FrameLayout wrap = new android.widget.FrameLayout(this);
+        int pad = Ui.dp(this, 20);
+        wrap.setPadding(pad, pad, pad, pad);
+        final android.widget.ImageView iv = new android.widget.ImageView(this);
+        android.widget.FrameLayout.LayoutParams lp = new android.widget.FrameLayout.LayoutParams(
+                Ui.dp(this, 220), Ui.dp(this, 220));
+        lp.gravity = android.view.Gravity.CENTER;
+        iv.setLayoutParams(lp);
+        wrap.addView(iv);
+
+        final androidx.appcompat.app.AlertDialog dlg =
+                new androidx.appcompat.app.AlertDialog.Builder(this)
+                        .setTitle("让对方扫这个")
+                        .setView(wrap)
+                        .setMessage(ip + ":" + port)
+                        .setPositiveButton("完成", null)
+                        .create();
+        dlg.show();
+        // 二维码在主线程生成会卡一两百毫秒，放后台
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                final android.graphics.Bitmap bm = QrUtil.encode(payload, 720);
+                if (bm == null) return;
+                runOnUiThread(new Runnable() {
+                    @Override
+                    public void run() {
+                        iv.setImageBitmap(bm);
+                    }
+                });
+            }
+        }, "lanmesh-qr").start();
+    }
+
+    private void handleLanScan(String text) {
+        if (text == null || !text.startsWith("lm1|")) {
+            Ui.toast(this, "不是 Link Mesh 的连接码");
+            return;
+        }
+        try {
+            String[] p = text.split("\\|", 5);
+            if (p.length < 4) throw new IllegalArgumentException("bad");
+            String id = p[1];
+            String host = p[2];
+            int port = Integer.parseInt(p[3]);
+            String nick = p.length > 4 ? p[4] : "";
+            if (id.equals(core.prefs.deviceId())) {
+                Ui.toast(this, "这是本机的二维码");
+                return;
+            }
+            if (host == null || host.length() == 0 || port <= 0) throw new IllegalArgumentException("bad");
+            core.peers.upsert(id, nick, host, port, Peer.SRC_MANUAL);
+            refresh();
+            Ui.toast(this, "已添加 " + (nick == null || nick.length() == 0 ? "设备" : nick));
+        } catch (Throwable t) {
+            Ui.toast(this, "二维码内容无法识别");
+        }
     }
 
     private void manualAdd() {
@@ -2000,6 +2449,10 @@ public class MainActivity extends AppCompatActivity implements Bus.Listener {
             }
             if (requestCode == REQ_SCAN_ANSWER) {
                 P2pManager.get(this).applyAnswer(scanned);
+                return;
+            }
+            if (requestCode == REQ_SCAN_LAN) {
+                handleLanScan(scanned);
                 return;
             }
         }

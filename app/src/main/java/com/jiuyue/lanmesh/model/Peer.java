@@ -11,6 +11,11 @@ public class Peer {
     public static final String SRC_NSD = "nsd";
     public static final String SRC_MULTICAST = "multicast";
     public static final String SRC_MANUAL = "manual";
+    /** 来自本地历史记录（本次未发现到），仅用于"上次连过的设备"列表项。 */
+    public static final String SRC_MEMORY = "memory";
+    /** 通过 LocalSend 协议发现的对端（官方客户端，不跑我们的二进制协议）。 */
+    public static final String SRC_LOCALSEND = "localsend";
+    public static final String LS_PREFIX = "ls-";
 
     public final String deviceId;
     public volatile String nickname;
@@ -24,6 +29,17 @@ public class Peer {
     public volatile boolean trusted;
     /** 由发现层提供的协议版本，握手时会以真实值为准。 */
     public volatile int protoVersion = 1;
+    /** 是否从本地历史恢复的条目。记住的设备即使过期也不从列表移除。 */
+    public volatile boolean remembered;
+
+    /** 是否是 LocalSend 对端（走 HTTP API，不走我们的 TCP 帧协议）。 */
+    public boolean isLocalSend() {
+        return deviceId != null && deviceId.startsWith(LS_PREFIX);
+    }
+
+    public String lsFingerprint() {
+        return isLocalSend() ? deviceId.substring(LS_PREFIX.length()) : null;
+    }
 
     public Peer(String deviceId, String nickname, String host, int port, String source) {
         this.deviceId = deviceId;

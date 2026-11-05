@@ -196,7 +196,172 @@ public class TransferManager {
         return in;
     }
 
+    /** 用 LocalSend v2 API 推给对方（官方客户端只认这个协议）。 */
+    private void sendViaLocalSend(Peer peer, ChatMessage msg, Uri uri, String path, Job job) {
+        InputStream in = null;
+        try {
+            msg.status = ChatMessage.ST_SENDING;
+            msg.progress = 0;
+            Bus.post(Bus.MESSAGE_UPDATED, msg);
+
+            com.jiuyue.lanmesh.net.ls.LsDiscovery d =
+                    com.jiuyue.lanmesh.core.AppCore.get(ctx).lsDiscovery();
+            com.jiuyue.lanmesh.net.ls.LsDevice dev =
+                    d == null ? null : d.byFingerprint(peer.lsFingerprint());
+            if (dev == null) throw new IllegalStateException("对端已离线");
+
+            in = openInput(uri, path);
+            final ChatMessage fmsg = msg;
+            com.jiuyue.lanmesh.net.ls.LsClient.Result r =
+                    com.jiuyue.lanmesh.net.ls.LsClient.sendFile(ctx, dev, msg.fileName,
+                            guessMime(msg.fileName, uri), msg.fileSize, in,
+                            new com.jiuyue.lanmesh.net.ls.LsClient.Progress() {
+                                @Override
+                                public void onProgress(long sent, long total) {
+                                    // LocalSend 协议没有暂停/取消接口，只能靠中断本地写入来停
+                                    if (job.cancelled) throw new IllegalStateException("已取消");
+                                    if (total <= 0) return;
+                                    fmsg.progress = (int) (sent * 100 / total);
+                                    fmsg.speed = 0;
+                                    Bus.post(Bus.MESSAGE_UPDATED, fmsg);
+                                }
+                            });
+
+            if (r.ok) {
+                msg.status = ChatMessage.ST_DONE;
+                msg.progress = 100;
+                msg.sha256 = null; // LocalSend 没回校验值
+                msg.error = null;
+            } else if (job.cancelled) {
+                msg.status = ChatMessage.ST_CANCELLED;
+                msg.error = null;
+            } else {
+                msg.status = ChatMessage.ST_FAILED;
+                msg.error = r.error;
+            }
+            store.update(msg);
+            Bus.post(Bus.MESSAGE_UPDATED, msg);
+        } catch (Throwable t) {
+            msg.status = job.cancelled ? ChatMessage.ST_CANCELLED : ChatMessage.ST_FAILED;
+            msg.error = job.cancelled ? null
+                    : (t.getMessage() == null ? t.getClass().getSimpleName() : t.getMessage());
+            store.update(msg);
+            Bus.post(Bus.MESSAGE_UPDATED, msg);
+        } finally {
+            Util.closeQuietly(in);
+        }
+    }
+
+    private String guessMime(String name, Uri uri) {
+        try {
+            if (uri != null && "content".equals(uri.getScheme())) {
+                String t = ctx.getContentResolver().getType(uri);
+                if (t != null && t.length() > 0) return t;
+            }
+        } catch (Throwable ignored) {
+        }
+        if (name != null) {
+            String n = name.toLowerCase(java.util.Locale.US);
+            if (n.endsWith(".png")) return "image/png";
+            if (n.endsWith(".jpg") || n.endsWith(".jpeg")) return "image/jpeg";
+            if (n.endsWith(".gif")) return "image/gif";
+            if (n.endsWith(".webp")) return "image/webp";
+            if (n.endsWith(".mp4")) return "video/mp4";
+            if (n.endsWith(".mp3")) return "audio/mpeg";
+            if (n.endsWith(".pdf")) return "application/pdf";
+            if (n.endsWith(".txt")) return "text/plain";
+            if (n.endsWith(".zip")) return "application/zip";
+            if (n.endsWith(".apk")) return "application/vnd.android.package-archive";
+        }
+        return "application/octet-stream";
+    }
+
+    // ---------------- 文件哈希缓存 ----------------
+    // 同一个文件重复发（很常见：发错了再发、发给第二台设备）不必重算，
+    // 1GB 文件的 SHA-256 在手机 eMMC 上要 5-10 秒，期间用户看到的是 0%。
+
+    private static final int SHA_CACHE_MAX = 200;
+    private java.util.Map<String, String> shaCache;
+
+    private synchronized java.util.Map<String, String> shaCache() {
+        if (shaCache != null) return shaCache;
+        shaCache = new java.util.HashMap<String, String>();
+        try {
+            java.io.File f = new java.io.File(ctx.getFilesDir(), "sha_cache.txt");
+            if (f.isFile()) {
+                java.io.BufferedReader r = new java.io.BufferedReader(
+                        new java.io.InputStreamReader(new java.io.FileInputStream(f), "UTF-8"));
+                String line;
+                while ((line = r.readLine()) != null) {
+                    int i = line.indexOf('\t');
+                    if (i > 0) shaCache.put(line.substring(0, i), line.substring(i + 1));
+                }
+                r.close();
+            }
+        } catch (Throwable ignored) {
+        }
+        return shaCache;
+    }
+
+    private void shaCachePut(String key, String value) {
+        java.util.Map<String, String> map = shaCache();
+        map.put(key, value);
+        if (map.size() > SHA_CACHE_MAX) {
+            // 超量就清空重建，比维护 LRU 简单，代价可忽略
+            map.clear();
+            map.put(key, value);
+        }
+        try {
+            java.io.File f = new java.io.File(ctx.getFilesDir(), "sha_cache.txt");
+            java.io.BufferedWriter w = new java.io.BufferedWriter(
+                    new java.io.OutputStreamWriter(new java.io.FileOutputStream(f), "UTF-8"));
+            for (java.util.Map.Entry<String, String> e : map.entrySet()) {
+                w.write(e.getKey());
+                w.write('\t');
+                w.write(e.getValue());
+                w.write('\n');
+            }
+            w.close();
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /** 只对真实文件路径做缓存（content:// 拿不到 mtime，同大小不同内容会误命中）。 */
+    private String digestOf(Uri uri, String path) throws Exception {
+        String key = null;
+        if (path != null) {
+            try {
+                java.io.File f = new java.io.File(path);
+                if (f.isFile()) {
+                    key = path + "|" + f.length() + "|" + f.lastModified();
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+        if (key != null) {
+            String hit = shaCache().get(key);
+            if (hit != null && hit.length() == 64) return hit;
+        }
+        InputStream in = openInput(uri, path);
+        try {
+            String d = Util.sha256(in);
+            if (key != null && d != null && d.length() == 64) shaCachePut(key, d);
+            return d;
+        } finally {
+            Util.closeQuietly(in);
+        }
+    }
+
     private void doSendFile(Peer peer, ChatMessage msg, Uri uri, String path, Job job) {
+        // LocalSend 对端不跑我们的帧协议，走它的 HTTP API（明文 HTTP，无法加密）
+        if (peer != null && peer.isLocalSend()) {
+            if (prefs.encEnabled()) {
+                throw new IllegalStateException(
+                        "已开启传输加密，但 LocalSend 设备只支持明文传输。要发给它请先关闭加密");
+            }
+            sendViaLocalSend(peer, msg, uri, path, job);
+            return;
+        }
         Socket socket = null;
         InputStream in = null;
         String failReason = null;
@@ -204,13 +369,11 @@ public class TransferManager {
             // 1) 先整文件流式算 SHA-256（内存恒定 8KB）。1GB 文件在 eMMC 上约 5-10 秒，
             //    换来的是接收端可以无条件校验完整性。
             msg.status = ChatMessage.ST_SENDING;
-            msg.progress = 0;
+            msg.progress = -1; // 负数 = 正在算校验值，界面上有反馈，不是卡住
             Bus.post(Bus.MESSAGE_UPDATED, msg);
 
-            in = openInput(uri, path);
-            String digest = Util.sha256(in);
-            Util.closeQuietly(in);
-            in = null;
+            String digest = digestOf(uri, path);
+            msg.progress = 0;
 
             if (job.cancelled) throw new InterruptedException("已取消");
 
@@ -229,9 +392,10 @@ public class TransferManager {
             hello.put("deviceId", prefs.deviceId());
             hello.put("nickname", prefs.nickname());
             hello.put("port", 0); // 发送方不需要对方回连
+            String myNonce = EncHandshake.attach(hello, prefs);
             writer.writeJson(Protocol.T_HELLO, hello);
 
-            if (!handshake(reader, writer, peer)) {
+            if (!handshake(reader, writer, peer, myNonce)) {
                 throw new IllegalStateException("对方未确认连接");
             }
 
@@ -420,13 +584,37 @@ public class TransferManager {
      * 客户端握手：HELLO 之后可能收到 TRUST_REQUEST（对方在等自己的用户确认），
      * 这时不是失败，需要继续等对方的最终答复。
      */
-    public boolean handshake(Protocol.Reader reader, Protocol.Writer writer, Peer peer) throws Exception {
+    /**
+     * @param myNonce HELLO 里带的本端随机数；对端未开加密时可为 null。
+     *                协商成功后在收到 HELLO_ACK 的这一步把读写切到加密。
+     */
+    public boolean handshake(Protocol.Reader reader, Protocol.Writer writer, Peer peer,
+                             String myNonce) throws Exception {
         long deadline = System.currentTimeMillis() + Const.TRUST_WAIT_MS + 5000;
         while (System.currentTimeMillis() < deadline) {
-            Protocol.Frame f = reader.read();
-            if (f == null) return false;
+            Protocol.Frame f;
+            try {
+                f = reader.read();
+            } catch (Protocol.DecryptException de) {
+                throw new IllegalStateException("两端加密口令不一致", de);
+            }
+            if (f == null) {
+                if (writer.encrypted()) {
+                    throw new IllegalStateException("对端解不开数据，请确认两端口令一致");
+                }
+                return false;
+            }
             if (f.type == Protocol.T_HELLO_ACK) {
                 JSONObject o = f.json();
+                if (!o.optBoolean("ok", true)) {
+                    String why = o.optString("reason", "");
+                    throw new IllegalStateException(why.length() == 0 ? "对方拒绝连接" : why);
+                }
+                Protocol.Secure sec = EncHandshake.build(o, myNonce, prefs);
+                if (sec != null) {
+                    writer.setSecure(sec);
+                    reader.setSecure(sec);
+                }
                 peer.nickname = o.optString("nickname", peer.nickname);
                 peer.trusted = true;
                 peer.lastSeen = System.currentTimeMillis();

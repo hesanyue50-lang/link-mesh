@@ -29,6 +29,70 @@ public class PeerRegistry {
     public PeerRegistry(Prefs prefs) {
         this.prefs = prefs;
         this.selfId = prefs.deviceId();
+        loadRemembered();
+    }
+
+    // ---------------- 历史设备（内存里记住上一台，重启后立刻可见） ----------------
+
+    private static final int MAX_REMEMBERED = 30;
+    private long lastPersistAt;
+
+    private void loadRemembered() {
+        String json = prefs.rememberedPeers();
+        if (json == null || json.length() == 0) return;
+        try {
+            org.json.JSONArray arr = new org.json.JSONArray(json);
+            for (int i = 0; i < arr.length(); i++) {
+                org.json.JSONObject o = arr.getJSONObject(i);
+                String id = o.optString("id", "");
+                String host = o.optString("host", "");
+                int port = o.optInt("port", 0);
+                if (id.length() == 0 || host.length() == 0 || port <= 0) continue;
+                if (id.equals(selfId)) continue;
+                Peer p = new Peer(id, o.optString("name", ""), host, port, Peer.SRC_MEMORY);
+                p.remembered = true;
+                p.lastSeen = o.optLong("seen", 0);
+                p.trusted = prefs.isTrusted(id);
+                peers.put(id, p);
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /** 落盘节流：发现层每秒可能 upsert 好几次，只在地址变化时写，且 5 秒最多一次。 */
+    private void persistLater() {
+        long now = System.currentTimeMillis();
+        if (now - lastPersistAt < 5000) return;
+        lastPersistAt = now;
+        persistNow();
+    }
+
+    public synchronized void persistNow() {
+        try {
+            List<Peer> all = new ArrayList<Peer>(peers.values());
+            // 只留最近活跃的 MAX_REMEMBERED 台，避免长期使用后无限增长
+            Collections.sort(all, new Comparator<Peer>() {
+                @Override
+                public int compare(Peer a, Peer b) {
+                    if (a.lastSeen == b.lastSeen) return 0;
+                    return a.lastSeen > b.lastSeen ? -1 : 1;
+                }
+            });
+            org.json.JSONArray arr = new org.json.JSONArray();
+            for (int i = 0; i < all.size() && i < MAX_REMEMBERED; i++) {
+                Peer p = all.get(i);
+                if (p.deviceId == null || p.host == null || p.port <= 0) continue;
+                org.json.JSONObject o = new org.json.JSONObject();
+                o.put("id", p.deviceId);
+                o.put("name", p.nickname == null ? "" : p.nickname);
+                o.put("host", p.host);
+                o.put("port", p.port);
+                o.put("seen", p.lastSeen);
+                arr.put(o);
+            }
+            prefs.setRememberedPeers(arr.toString());
+        } catch (Throwable ignored) {
+        }
     }
 
     public synchronized boolean upsert(String deviceId, String nickname, String host, int port, String source) {
@@ -54,6 +118,7 @@ public class PeerRegistry {
         if (p == null) {
             p = new Peer(deviceId, nickname, host, port, source);
             p.trusted = prefs.isTrusted(deviceId);
+            p.remembered = true;
             peers.put(deviceId, p);
             changed = true;
         } else {
@@ -64,6 +129,7 @@ public class PeerRegistry {
             if (!host.equals(p.host) || port != p.port) {
                 p.host = host;
                 p.port = port;
+                p.remembered = true;
                 changed = true;
             }
             p.lastSeen = System.currentTimeMillis();
@@ -74,6 +140,7 @@ public class PeerRegistry {
                 changed = true;
             }
         }
+        if (changed) persistLater();
         return changed;
     }
 
@@ -99,7 +166,8 @@ public class PeerRegistry {
         long now = System.currentTimeMillis();
         List<String> dead = new ArrayList<String>();
         for (Peer p : peers.values()) {
-            if (p.isExpired(now)) dead.add(p.deviceId);
+            // 记住的设备过期后保留为"离线"，直接从列表消失会让人以为丢数据
+            if (p.isExpired(now) && !p.remembered) dead.add(p.deviceId);
         }
         for (String id : dead) peers.remove(id);
         return !dead.isEmpty();
@@ -111,6 +179,7 @@ public class PeerRegistry {
 
     public synchronized void remove(String deviceId) {
         peers.remove(deviceId);
+        persistNow();
     }
 
     public synchronized List<Peer> list() {

@@ -21,6 +21,12 @@
     <color name="white">#FFFFFF</color>
 
     <color name="glass">#F2141619</color>
+    <color name="nav_glass">#F7141619</color>
+    <color name="nav_stroke">#1FFFFFFF</color>
+    <color name="nav_scrim_top">#000B0C0E</color>
+    <color name="nav_scrim_mid">#D90B0C0E</color>
+    <color name="nav_scrim_bottom">#FF0B0C0E</color>
+    <color name="nav_glass_edge">#1AFFFFFF</color>
     <color name="glass_night">#F2141619</color>
     <color name="scrim">#99000000</color>
     <color name="shadow">#00000000</color>

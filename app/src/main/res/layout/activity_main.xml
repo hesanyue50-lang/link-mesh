@@ -1,18 +1,17 @@
 <?xml version="1.0" encoding="utf-8"?>
-<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:app="http://schemas.android.com/apk/res-auto"
     android:id="@+id/main_root"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    android:orientation="vertical"
     android:background="@color/bg">
 
-    <!-- 三页横向分页：跟手拖动，松手按速度吸附（见 PanelPager） -->
+    <!-- 三页横向分页：跟手拖动，松手按速度吸附（见 PanelPager）
+         全屏铺满，内容从悬浮导航下面穿过 -->
     <com.jiuyue.lanmesh.ui.PanelPager
         android:id="@+id/panel_pager"
         android:layout_width="match_parent"
-        android:layout_height="0dp"
-        android:layout_weight="1">
+        android:layout_height="match_parent">
 
         <LinearLayout
             android:id="@+id/page_row"
@@ -40,23 +39,31 @@
         </LinearLayout>
     </com.jiuyue.lanmesh.ui.PanelPager>
 
+    <!-- 内容淡出遮罩：滚动内容在悬浮导航上方渐隐，是"浮起来"的关键 -->
+    <View
+        android:id="@+id/nav_scrim"
+        android:layout_width="match_parent"
+        android:layout_height="150dp"
+        android:layout_gravity="bottom"
+        android:background="@drawable/bg_nav_scrim" />
+
     <!-- 悬浮胶囊导航：一个独立的滑块 View 由滚动进度驱动，不播放动画器 -->
     <FrameLayout
         android:id="@+id/nav_container"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
+        android:layout_gravity="bottom"
         android:paddingLeft="16dp"
         android:paddingRight="16dp"
-        android:paddingTop="8dp"
-        android:paddingBottom="12dp">
+        android:paddingTop="10dp"
+        android:paddingBottom="16dp">
 
         <FrameLayout
             android:id="@+id/seg_wrap"
             android:layout_width="match_parent"
             android:layout_height="64dp"
             android:background="@drawable/bg_nav"
-            android:elevation="8dp"
-            android:padding="6dp">
+            android:padding="5dp">
 
             <View
                 android:id="@+id/nav_slider"
@@ -95,7 +102,7 @@
                         android:layout_marginTop="3dp"
                         android:text="@string/tab_lan"
                         android:textColor="@color/nav_text"
-                        android:textSize="10sp" />
+                        android:textSize="11sp" />
                 </LinearLayout>
 
                 <LinearLayout
@@ -123,7 +130,7 @@
                         android:layout_marginTop="3dp"
                         android:text="@string/tab_p2p"
                         android:textColor="@color/nav_text"
-                        android:textSize="10sp" />
+                        android:textSize="11sp" />
                 </LinearLayout>
 
                 <LinearLayout
@@ -151,9 +158,9 @@
                         android:layout_marginTop="3dp"
                         android:text="@string/tab_settings"
                         android:textColor="@color/nav_text"
-                        android:textSize="10sp" />
+                        android:textSize="11sp" />
                 </LinearLayout>
             </LinearLayout>
         </FrameLayout>
     </FrameLayout>
-</LinearLayout>
+</FrameLayout>

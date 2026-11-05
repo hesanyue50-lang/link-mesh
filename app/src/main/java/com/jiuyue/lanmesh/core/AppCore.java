@@ -27,6 +27,8 @@ public final class AppCore {
     public final PeerRegistry peers;
 
     private NetService service;
+    private com.jiuyue.lanmesh.net.ls.LsDiscovery lsDiscovery;
+    private com.jiuyue.lanmesh.net.ls.LsServer lsServer;
 
     private AppCore(Context ctx) {
         Context app = ctx.getApplicationContext();
@@ -83,5 +85,21 @@ public final class AppCore {
 
     public synchronized NetService service() {
         return service;
+    }
+
+    public synchronized com.jiuyue.lanmesh.net.ls.LsDiscovery lsDiscovery() {
+        return lsDiscovery;
+    }
+
+    public synchronized void attachLsDiscovery(com.jiuyue.lanmesh.net.ls.LsDiscovery d) {
+        this.lsDiscovery = d;
+    }
+
+    public synchronized com.jiuyue.lanmesh.net.ls.LsServer lsServer() {
+        return lsServer;
+    }
+
+    public synchronized void attachLsServer(com.jiuyue.lanmesh.net.ls.LsServer s) {
+        this.lsServer = s;
     }
 }

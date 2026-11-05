@@ -64,6 +64,7 @@ public class Session implements Runnable {
 
     @Override
     public void run() {
+        boolean pendingTrust = false;
         Protocol.Reader reader = null;
         Protocol.Writer writer = null;
         try {
@@ -123,9 +124,7 @@ public class Session implements Runnable {
                     writer.writeJson(Protocol.T_TRUST_DENIED, o);
                     return;
                 }
-                prefs.trust(deviceId);
-                peer.trusted = true;
-                Bus.post(Bus.PEERS_CHANGED, null);
+                pendingTrust = true; // 先不落库：等确认对端口令一致（首帧能解开）再记住
             }
 
             JSONObject ack = new JSONObject();
@@ -133,12 +132,45 @@ public class Session implements Runnable {
             ack.put("deviceId", prefs.deviceId());
             ack.put("nickname", prefs.nickname());
             ack.put("port", 0);
+
+            // 加密协商：在 ACK 之前算好，ACK 之后双方同时切换
+            String myNonce = EncHandshake.attachAck(ack, prefs);
+            Protocol.Secure sec;
+            try {
+                sec = EncHandshake.build(hello, myNonce, prefs);
+            } catch (Exception enc) {
+                JSONObject err = new JSONObject();
+                err.put("ok", false);
+                err.put("reason", EncHandshake.why(enc));
+                writer.writeJson(Protocol.T_HELLO_ACK, err);
+                Log.w(TAG, "enc negotiation failed: " + EncHandshake.why(enc));
+                return;
+            }
+
             writer.writeJson(Protocol.T_HELLO_ACK, ack);
+            // 注意：这两行之间不要再插入任何写帧，对端此刻已经/即将切到加密通道
+            if (sec != null) {
+                writer.setSecure(sec);
+                reader.setSecure(sec);
+            } else if (pendingTrust) {
+                // 明文会话没有"口令一致性"可验，维持原来的行为
+                prefs.trust(deviceId);
+                peer.trusted = true;
+                pendingTrust = false;
+                Bus.post(Bus.PEERS_CHANGED, null);
+            }
 
             // 握手后可以连续多帧：文本 → ACK；文件 → 收完再继续
             while (true) {
                 Protocol.Frame f = reader.read();
                 if (f == null) break;
+                if (pendingTrust) {
+                    // 能解开第一帧 = 对端口令与本机一致，此时才把设备写进信任列表
+                    pendingTrust = false;
+                    prefs.trust(deviceId);
+                    peer.trusted = true;
+                    Bus.post(Bus.PEERS_CHANGED, null);
+                }
                 if (f.type == Protocol.T_TEXT) {
                     handleText(f.json(), peer, writer);
                 } else if (f.type == Protocol.T_FILE_OFFER) {
@@ -152,6 +184,9 @@ public class Session implements Runnable {
                     break;
                 }
             }
+        } catch (Protocol.DecryptException de) {
+            Log.w(TAG, "decrypt failed", de);
+            Bus.toast("有设备尝试连接，但两端口令不一致");
         } catch (Throwable t) {
             String m = t.getMessage();
             if (m != null && m.contains("Socket closed")) {

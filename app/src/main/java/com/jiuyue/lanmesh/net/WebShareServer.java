@@ -538,6 +538,19 @@ public class WebShareServer {
             m.text = msg.replace("\n", " ");
             m.status = com.jiuyue.lanmesh.model.ChatMessage.ST_SENT;
             com.jiuyue.lanmesh.core.AppCore.get(ctx).messages.append(m);
+            // 可选：写进手机剪贴板。默认关 —— 同网段任何人都能访问网页端并调这个接口，
+            // 默认自动写等于把剪贴板交给别人，可以拿来做粘贴劫持。
+            try {
+                if (com.jiuyue.lanmesh.core.AppCore.get(ctx).prefs.autoClipFromWeb()
+                        && msg.length() <= 4000) {
+                    android.content.ClipboardManager cm = (android.content.ClipboardManager)
+                            ctx.getSystemService(android.content.Context.CLIPBOARD_SERVICE);
+                    if (cm != null) {
+                        cm.setPrimaryClip(android.content.ClipData.newPlainText("Link Mesh", msg));
+                    }
+                }
+            } catch (Throwable ignored) {
+            }
             Bus.post(Bus.TOAST, "浏览器消息: " + msg);
         } catch (Throwable t) {
             Log.w(TAG, "append text failed", t);
@@ -624,7 +637,9 @@ public class WebShareServer {
                 boolean mine = ("web-" + guest).equals(m.peerDeviceId);
                 item.put("mine", mine);
                 String sender;
-                if (m.peerDeviceId != null && m.peerDeviceId.startsWith("web-")) {
+                if (com.jiuyue.lanmesh.model.ChatMessage.DIR_OUT.equals(m.direction)) {
+                    sender = prefs.nickname();
+                } else if (m.peerDeviceId != null && m.peerDeviceId.startsWith("web-")) {
                     String g = m.peerDeviceId.substring(4);
                     sender = "访客-" + (g.length() > 4 ? g.substring(g.length() - 4) : g);
                 } else if (com.jiuyue.lanmesh.model.ChatMessage.DIR_IN.equals(m.direction)) {
@@ -703,6 +718,7 @@ public class WebShareServer {
                 + ".acts{margin-top:7px;display:flex;gap:14px}"
                 + ".acts a{font-size:12px;color:var(--accent);cursor:pointer}"
                 + ".acts a.cancel{color:#e06a6a}"
+                + ".copy{cursor:pointer;word-break:break-word;transition:opacity .15s}"
                 + "</style></head><body><div class='app'>"
                 + "<header><div class='dot'></div><div class='who'><h1 id='name'>Link Mesh</h1>"
                 + "<div class='sub' id='sub'>连接中…</div></div>"
@@ -722,6 +738,16 @@ public class WebShareServer {
                 + "return p(d.getMonth()+1)+'-'+p(d.getDate())+' '+p(d.getHours())+':'+p(d.getMinutes());}"
                 + "function human(b){return b<1024?b+' B':(b<1048576?(b/1024).toFixed(1)+' KB':(b/1048576).toFixed(1)+' MB');}"
                 + "var box=document.getElementById('msgs');var lastCount=-1;"
+                + "function pick(el){try{var r=document.createRange();r.selectNodeContents(el);"
+                + "var s2=window.getSelection();s2.removeAllRanges();s2.addRange(r);}catch(e){}}"
+                + "function copyText(txt,el){var ok=false;try{var ta=document.createElement('textarea');"
+                + "ta.value=txt;ta.style.position='fixed';ta.style.top='-999px';document.body.appendChild(ta);"
+                + "ta.focus();ta.select();ok=document.execCommand('copy');document.body.removeChild(ta);}catch(e){}"
+                + "if(!ok){pick(el);return;}var o=el.style.opacity;el.style.opacity='.4';"
+                + "setTimeout(function(){el.style.opacity=o;},200);}"
+                + "box.addEventListener('click',function(e){var t=e.target;"
+                + "while(t&&t!==box&&!(t.classList&&t.classList.contains('copy')))t=t.parentNode;"
+                + "if(!t||t===box)return;copyText(decodeURIComponent(t.getAttribute('data-c')||''),t);});"
                 + "function nearBottom(){return box.scrollHeight-box.scrollTop-box.clientHeight<120;}"
                 + "function toBottom(){requestAnimationFrame(function(){box.scrollTop=box.scrollHeight;});}"
                 + "function refresh(){var keep=nearBottom();"
@@ -735,7 +761,7 @@ public class WebShareServer {
                 + "if(m.type==='file'){html+='<div class=fname>'+esc(m.name)+'</div>';"
                 + "html+='<div class=fmeta>'+m.human+'</div>';"
                 + "html+='<a class=fdl data-n=\"'+encodeURIComponent(m.name)+'\">下载</a>';}"
-                + "else{html+=esc(m.text);}"
+                + "else{html+='<div class=copy data-c=\"'+encodeURIComponent(m.text||'')+'\">'+esc(m.text)+'</div>';}"
                 + "html+='<time>'+fmt(m.time)+'</time></div>';});"
                 + "box.innerHTML=html||'<div class=empty>还没有消息<br>发一条试试，或点左下角 + 上传文件</div>';"
                 + "if(keep)toBottom();}}).catch(function(){});}"

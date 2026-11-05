@@ -19,17 +19,29 @@ if [ ! -f keystore.properties ]; then
   exit 1
 fi
 
-OLD_CODE=$(sed -n 's/^[[:space:]]*versionCode \([0-9]*\).*/\1/p' app/build.gradle | head -1)
-NEW_CODE=$((OLD_CODE + 1))
-sed -i "s/versionCode $OLD_CODE/versionCode $NEW_CODE/" app/build.gradle
+# versionCode 用单调递增的发布号，存在 build/version.txt（debug 构建用时间戳，不参与）
+CODE_FILE="build/version.txt"
+# 基线取「历史发布号」与「当前时间戳号（与 debug 同源）」的较大者，
+# 否则 release 的号会低于手机上已装的 debug 包，安装时被系统判成降级
+NOW_CODE=$(( $(date +%s) / 60 ))
+LAST_CODE=0
+if [ -f "$CODE_FILE" ]; then
+  LAST_CODE=$(cat "$CODE_FILE" | tr -cd '0-9')
+fi
+[ -z "$LAST_CODE" ] && LAST_CODE=0
+[ "$LAST_CODE" -lt "$NOW_CODE" ] && LAST_CODE=$NOW_CODE
+NEW_CODE=$((LAST_CODE + 1))
+mkdir -p build
+echo "$NEW_CODE" > "$CODE_FILE"
 sed -i "s/versionName '[^']*'/versionName '$VERSION'/" app/build.gradle
-echo "版本: $VERSION (versionCode=$NEW_CODE)"
+echo "版本: $VERSION (versionCode=$NEW_CODE，下次从 $NEW_CODE 继续)"
 
 JAVA_HOME=${JAVA_HOME:-/usr/lib/jvm/java-17-openjdk}
 ANDROID_HOME=${ANDROID_HOME:-/opt/android-sdk}
 export JAVA_HOME ANDROID_HOME
 
-/opt/gradle/gradle-8.13/bin/gradle :app:assembleRelease --no-daemon --max-workers=2 \
+/opt/gradle/gradle-8.13/bin/gradle :app:assembleRelease --no-daemon --max-workers=1 \
+  -Pvc="$NEW_CODE" \
   -Pandroid.aapt2FromMavenOverride=/opt/aapt2-qemu/aapt2
 
 mkdir -p dist

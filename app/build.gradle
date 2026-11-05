@@ -20,8 +20,10 @@ android {
         // 版本规则：MAJOR.MINOR.PATCH[-STAGE]
         //   MAJOR 协议/数据不兼容；MINOR 功能阶段；PATCH 修复
         //   versionCode 每次发版单调 +1，与 versionName 解耦
-        versionCode 147
-        versionName '1.5.2'
+        //   debug 用时间戳（分钟粒度）自动递增：同一个号反复装会被系统拒装，
+        //   而开发期间一天要装十几次。正式包装走 release.sh 的 -Pvc= 覆盖。
+        versionCode project.hasProperty("vc") ? project.property("vc").toInteger() : (int) (System.currentTimeMillis() / 60000L)
+        versionName '1.7.0'
         // 底部导航用 Lucide 矢量图标；API 19 上由 AppCompat 负责解析
         vectorDrawables.useSupportLibrary = true
         ndk { abiFilters 'arm64-v8a', 'armeabi-v7a' }

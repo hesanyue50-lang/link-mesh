@@ -215,6 +215,11 @@ public class ChatActivity extends AppCompatActivity implements Bus.Listener {
     private void sendText() {
         String text = input.getText().toString();
         if (TextUtils.isEmpty(text) || peer == null) return;
+        if (peer.isLocalSend()) {
+            // LocalSend 只定义文件接口，没有文本通道；发出去只会超时
+            Ui.toast(this, "LocalSend 设备只支持收发文件，不能发文字");
+            return;
+        }
         if (text.length() > com.jiuyue.lanmesh.core.Const.MAX_TEXT_CHARS) {
             Ui.toast(this, "消息过长，最多 " + com.jiuyue.lanmesh.core.Const.MAX_TEXT_CHARS + " 字");
             return;

@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  加密口令不进云备份：两台设备共用同一个秘密，被备份带走等于泄露。
+  聊天记录、设备记忆仍然正常备份。
+-->
+<full-backup-content>
+    <exclude domain="sharedpref" path="lanmesh_prefs.xml" />
+</full-backup-content>

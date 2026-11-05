@@ -272,6 +272,140 @@
             </LinearLayout>
         </LinearLayout>
 
+        <!-- 安全 -->
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="24dp"
+            android:layout_marginBottom="8dp"
+            android:text="安全"
+            style="@style/TextLabel" />
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:background="@drawable/bg_panel"
+            android:padding="6dp">
+
+            <LinearLayout
+                android:id="@+id/row_enc"
+                android:layout_width="match_parent"
+                android:layout_height="56dp"
+                android:background="@drawable/bg_card_row"
+                android:gravity="center_vertical"
+                android:orientation="horizontal"
+                android:paddingLeft="14dp"
+                android:paddingRight="14dp">
+
+                <TextView
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="传输加密"
+                    android:textColor="@color/text"
+                    android:textSize="14sp" />
+
+                <com.jiuyue.lanmesh.ui.AnimSwitch
+                    android:id="@+id/sw_enc"
+                    android:layout_width="52dp"
+                    android:layout_height="32dp"
+                    android:clickable="false"
+                    android:focusable="false" />
+            </LinearLayout>
+
+            <View
+                android:layout_width="match_parent"
+                android:layout_height="1dp"
+                android:layout_marginLeft="14dp"
+                android:layout_marginRight="14dp"
+                android:background="@color/stroke" />
+
+            <LinearLayout
+                android:id="@+id/row_enc_pass"
+                android:layout_width="match_parent"
+                android:layout_height="56dp"
+                android:background="@drawable/bg_card_row"
+                android:gravity="center_vertical"
+                android:orientation="horizontal"
+                android:paddingLeft="14dp"
+                android:paddingRight="14dp">
+
+                <TextView
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="加密口令"
+                    android:textColor="@color/text"
+                    android:textSize="14sp" />
+
+                <TextView
+                    android:id="@+id/tv_enc_pass"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:textColor="@color/text_dim"
+                    android:textSize="13sp"
+                    android:text="未设置" />
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="6dp"
+                    android:text="›"
+                    android:textColor="@color/text_faint"
+                    android:textSize="16sp" />
+            </LinearLayout>
+
+            <View
+                android:layout_width="match_parent"
+                android:layout_height="1dp"
+                android:layout_marginLeft="14dp"
+                android:layout_marginRight="14dp"
+                android:background="@color/stroke" />
+
+            <LinearLayout
+                android:id="@+id/row_auto_clip"
+                android:layout_width="match_parent"
+                android:layout_height="56dp"
+                android:background="@drawable/bg_card_row"
+                android:gravity="center_vertical"
+                android:orientation="horizontal"
+                android:paddingLeft="14dp"
+                android:paddingRight="14dp">
+
+                <TextView
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="网页消息自动进剪贴板"
+                    android:textColor="@color/text"
+                    android:textSize="14sp" />
+
+                <com.jiuyue.lanmesh.ui.AnimSwitch
+                    android:id="@+id/sw_auto_clip"
+                    android:layout_width="52dp"
+                    android:layout_height="32dp"
+                    android:clickable="false"
+                    android:focusable="false" />
+            </LinearLayout>
+
+            <View
+                android:layout_width="match_parent"
+                android:layout_height="1dp"
+                android:layout_marginLeft="14dp"
+                android:layout_marginRight="14dp"
+                android:background="@color/stroke" />
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:padding="14dp"
+                android:textColor="@color/text_faint"
+                android:textSize="11sp"
+                android:lineSpacingExtra="3dp"
+                android:text="开启后，两台设备必须填相同口令才能连上，App 之间的聊天与文件用 AES-GCM 加密。口令越短越容易被猜出，建议 8 位以上；口令只保存在本机，不会外发。对方是旧版本时会直接拒绝，不会退回明文。网页端（浏览器）走 HTTP，不在此加密范围内。" />
+        </LinearLayout>
+
         <!-- 下载 -->
         <TextView
             android:layout_width="wrap_content"
