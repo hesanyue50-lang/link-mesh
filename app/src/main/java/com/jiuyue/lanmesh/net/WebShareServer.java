@@ -1,6 +1,7 @@
 package com.jiuyue.lanmesh.net;
 
 import android.content.Context;
+import android.os.Environment;
 import android.util.Log;
 
 import com.jiuyue.lanmesh.core.Bus;
@@ -20,11 +21,13 @@ import java.io.PrintWriter;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.URLDecoder;
+import java.net.URLEncoder;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Date;
 import java.util.List;
 import java.util.Locale;
+import java.util.TimeZone;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
@@ -144,6 +147,8 @@ public class WebShareServer {
 
             long contentLength = 0;
             String rangeHeader = null;
+            String authHeader = null;
+            String depthHeader = null;
             String line;
             while ((line = readLine(in)) != null && line.length() > 0) {
                 int idx = line.indexOf(':');
@@ -157,18 +162,51 @@ public class WebShareServer {
                         }
                     } else if ("range".equals(k)) {
                         rangeHeader = v;
+                    } else if ("authorization".equals(k)) {
+                        authHeader = v;
+                    } else if ("depth".equals(k)) {
+                        depthHeader = v;
                     }
                 }
             }
 
-            if ("GET".equals(method) && ("/".equals(path) || "/index.html".equals(path))) {
+            String bare = path;
+            int qm = bare.indexOf('?');
+            if (qm >= 0) bare = bare.substring(0, qm);
+
+            if ("OPTIONS".equals(method)) {
+                sendOptions(socket);
+            } else if ("PROPFIND".equals(method)) {
+                if (!davAuthorized(authHeader)) {
+                    sendAuthRequired(socket);
+                } else {
+                    sendPropfind(socket, bare, depthHeader);
+                }
+            } else if (("GET".equals(method) || "HEAD".equals(method))
+                    && authHeader != null && isDavPath(bare)) {
+                // 带 Basic 凭据、又不是应用自己的路由：按 WebDAV 根解析路径
+                if (!davAuthorized(authHeader)) {
+                    sendAuthRequired(socket);
+                } else {
+                    sendDavFile(socket, bare, "HEAD".equals(method), rangeHeader);
+                }
+            } else if ("GET".equals(method) && ("/".equals(path) || "/index.html".equals(path))) {
                 sendHtml(socket, page());
+            } else if ("GET".equals(method) && (path.equals("/ls") || path.startsWith("/ls?"))) {
+                sendDirListing(socket, paramRaw(path, "path"));
             } else if ("GET".equals(method) && path.startsWith("/api/state")) {
                 sendJson(socket, stateJson(guest));
             } else if ("GET".equals(method) && path.startsWith("/app.apk")) {
                 sendApk(socket);
-            } else if (("GET".equals(method) || "HEAD".equals(method)) && path.startsWith("/f?")) {
-                sendFile(socket, param(path, "name"), "HEAD".equals(method), rangeHeader);
+            } else if (("GET".equals(method) || "HEAD".equals(method))
+                    && (path.equals("/f") || path.startsWith("/f?"))) {
+                String fp = paramRaw(path, "path");
+                if (fp != null) {
+                    boolean inline = "1".equals(param(path, "inline"));
+                    sendBrowsed(socket, fp, "HEAD".equals(method), rangeHeader, inline);
+                } else {
+                    sendFile(socket, param(path, "name"), "HEAD".equals(method), rangeHeader);
+                }
             } else if ("GET".equals(method) && path.startsWith("/upload/size")) {
                 uploadSize(socket, param(path, "name"));
             } else if ("PUT".equals(method) && path.startsWith("/upload")) {
@@ -243,6 +281,49 @@ public class WebShareServer {
         return null;
     }
 
+    /** 取原始（未解码）查询参数。路径类参数必须自己解码，否则文件名里的 '+' 会变成空格。 */
+    private String paramRaw(String path, String key) {
+        int q = path.indexOf('?');
+        if (q < 0) return null;
+        String[] pairs = path.substring(q + 1).split("&");
+        for (String p : pairs) {
+            int eq = p.indexOf('=');
+            if (eq > 0 && p.substring(0, eq).equals(key)) {
+                String v = p.substring(eq + 1);
+                return v.length() == 0 ? null : v;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * 路径解码：请求行和查询串里的 '+' 都表示字面加号（文件名常见 a+b.mp4），
+     * 而 URLDecoder 会把 '+' 当空格，所以先把 '+' 转成 %2B 再解。
+     */
+    private static String decodePath(String s) {
+        if (s == null) return "";
+        try {
+            return URLDecoder.decode(s.replace("+", "%2B"), "UTF-8");
+        } catch (Throwable t) {
+            return s;
+        }
+    }
+
+    /** 相对路径归一：去掉首尾斜杠、反斜杠统一成 '/'。'..' 交给 canonical 校验去挡。 */
+    private static String normalizeRel(String rel) {
+        if (rel == null) return "";
+        String r = rel.replace('\\', '/');
+        while (r.startsWith("/")) r = r.substring(1);
+        while (r.endsWith("/")) r = r.substring(0, r.length() - 1);
+        return r;
+    }
+
+    private static String parentRel(String rel) {
+        if (rel == null || rel.length() == 0) return "";
+        int i = rel.lastIndexOf('/');
+        return i < 0 ? "" : rel.substring(0, i);
+    }
+
     // ---------------- 路由实现 ----------------
 
     /** 浏览器上传/中转的文件单独放 web/ 子目录，开关关闭时可以整目录清理。 */
@@ -313,6 +394,296 @@ public class WebShareServer {
         if (dir == null) dir = new File(ctx.getFilesDir(), "LanMesh");
         if (!dir.exists()) dir.mkdirs();
         return dir;
+    }
+
+    // ---------------- 文件浏览 + WebDAV ----------------
+
+    /** 单目录最多返回的条目数，超大目录不至于把手机和浏览器一起拖死。 */
+    private static final int LS_LIMIT = 2000;
+
+    /**
+     * 浏览根目录：优先外部存储根（Android 11+ 需要「所有文件访问」权限），
+     * 读不到就回退 App 外部私有目录，再退到内部私有目录。
+     */
+    private File browseRoot() {
+        try {
+            File ext = Environment.getExternalStorageDirectory();
+            // Android 11+ 没有「所有文件访问」时，/sdcard 能列出名字但读不了内容，
+            // 表现是「目录看得见、点下载 0 字节」。所以必须按权限决定根目录。
+            boolean allFiles = android.os.Build.VERSION.SDK_INT < 30
+                    || Environment.isExternalStorageManager();
+            if (allFiles && isReadableDir(ext)) return ext;
+        } catch (Throwable ignored) {
+        }
+        try {
+            File app = ctx.getExternalFilesDir(null);
+            if (isReadableDir(app)) return app;
+        } catch (Throwable ignored) {
+        }
+        return ctx.getFilesDir();
+    }
+
+    private static boolean isReadableDir(File d) {
+        try {
+            return d != null && d.isDirectory() && d.canRead() && d.listFiles() != null;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    private String browseRootLabel(File root) {
+        try {
+            if (root != null && root.getCanonicalPath()
+                    .equals(Environment.getExternalStorageDirectory().getCanonicalPath())) {
+                return "内部存储";
+            }
+        } catch (Throwable ignored) {
+        }
+        return root == null ? "文件" : root.getName();
+    }
+
+    /**
+     * 相对路径 -> root 下的真实文件，带路径穿越校验。
+     * 返回 null 表示越界（'..'、绝对路径、符号链接逃逸），调用方回 403。
+     */
+    private File resolveUnder(File root, String rel) {
+        try {
+            File rootCanon = root.getCanonicalFile();
+            File canon = new File(rootCanon, normalizeRel(rel)).getCanonicalFile();
+            String base = rootCanon.getPath();
+            String p = canon.getPath();
+            if (p.equals(base)) return canon;
+            String prefix = base.endsWith(File.separator) ? base : base + File.separator;
+            if (!p.startsWith(prefix)) return null;
+            return canon;
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    private static String relOf(File root, File f) {
+        try {
+            String base = root.getCanonicalPath();
+            String p = f.getCanonicalPath();
+            if (p.equals(base)) return "";
+            if (p.startsWith(base + File.separator)) {
+                return p.substring(base.length() + 1).replace(File.separatorChar, '/');
+            }
+        } catch (Throwable ignored) {
+        }
+        return f.getName();
+    }
+
+    /** 目录在前、名字升序；返回 null 表示目录不可读。 */
+    private static List<File> sortedChildren(File dir) {
+        File[] list = dir.listFiles();
+        if (list == null) return null;
+        List<File> out = new ArrayList<File>();
+        for (File f : list) {
+            if (f != null) out.add(f);
+        }
+        java.util.Collections.sort(out, new java.util.Comparator<File>() {
+            @Override
+            public int compare(File a, File b) {
+                boolean da = a.isDirectory();
+                boolean db = b.isDirectory();
+                if (da != db) return da ? -1 : 1;
+                int c = a.getName().compareToIgnoreCase(b.getName());
+                return c != 0 ? c : a.getName().compareTo(b.getName());
+            }
+        });
+        return out;
+    }
+
+    /** GET /ls?path= —— 目录列表 JSON，供网页端文件浏览。 */
+    private void sendDirListing(Socket socket, String rawPath) throws Exception {
+        File root = browseRoot();
+        String rel = normalizeRel(decodePath(rawPath));
+        File dir = resolveUnder(root, rel);
+        if (dir == null) {
+            sendStatus(socket, 403, "forbidden");
+            return;
+        }
+        if (!dir.exists()) {
+            sendStatus(socket, 404, "not found");
+            return;
+        }
+        if (!dir.isDirectory()) {
+            sendStatus(socket, 400, "not a directory");
+            return;
+        }
+        List<File> all = sortedChildren(dir);
+        if (all == null) {
+            sendStatus(socket, 403, "cannot list");
+            return;
+        }
+        boolean truncated = all.size() > LS_LIMIT;
+        int n = Math.min(all.size(), LS_LIMIT);
+        JSONArray arr = new JSONArray();
+        for (int i = 0; i < n; i++) {
+            File f = all.get(i);
+            JSONObject it = new JSONObject();
+            it.put("name", f.getName());
+            it.put("dir", f.isDirectory());
+            it.put("size", f.isDirectory() ? 0 : f.length());
+            it.put("mtime", f.lastModified());
+            arr.put(it);
+        }
+        JSONObject o = new JSONObject();
+        o.put("ok", true);
+        o.put("path", rel);
+        o.put("parent", parentRel(rel));
+        o.put("root", browseRootLabel(root));
+        o.put("items", arr);
+        if (truncated) o.put("truncated", true);
+        sendJson(socket, o.toString());
+    }
+
+    /** GET/HEAD /f?path= —— 浏览根里的文件；inline=1 时让浏览器内联播放。 */
+    private void sendBrowsed(Socket socket, String rawPath, boolean head, String range,
+                             boolean inline) throws Exception {
+        File root = browseRoot();
+        String rel = normalizeRel(decodePath(rawPath));
+        File f = resolveUnder(root, rel);
+        if (f == null) {
+            sendStatus(socket, 403, "forbidden");
+            return;
+        }
+        if (!f.exists()) {
+            sendStatus(socket, 404, "not found");
+            return;
+        }
+        if (f.isDirectory()) {
+            sendStatus(socket, 400, "is a directory");
+            return;
+        }
+        sendFileBody(socket, f, head, range, mimeOf(f.getName()), inline, f.getName());
+    }
+
+    /** WebDAV 的 GET/HEAD：路径同样相对浏览根。 */
+    private void sendDavFile(Socket socket, String bare, boolean head, String range)
+            throws Exception {
+        File root = browseRoot();
+        String rel = normalizeRel(decodePath(bare));
+        File f = resolveUnder(root, rel);
+        if (f == null) {
+            sendStatus(socket, 403, "forbidden");
+            return;
+        }
+        if (!f.exists()) {
+            sendStatus(socket, 404, "not found");
+            return;
+        }
+        if (f.isDirectory()) {
+            sendStatus(socket, 400, "is a directory");
+            return;
+        }
+        sendFileBody(socket, f, head, range, mimeOf(f.getName()), false, f.getName());
+    }
+
+    /** 真正发文件的地方，Range/断点续传逻辑都在这里。 */
+    private void sendFileBody(Socket socket, File f, boolean head, String range,
+                              String contentType, boolean inline, String name) throws Exception {
+        String safe = headerSafe(name);
+        long total = f.length();
+        long start = 0;
+        long end = total - 1;
+        if (range != null && range.startsWith("bytes=")) {
+            try {
+                String spec = range.substring(6).split(",")[0].trim();
+                int dash = spec.indexOf('-');
+                if (dash >= 0) {
+                    String a = spec.substring(0, dash).trim();
+                    String b = spec.substring(dash + 1).trim();
+                    if (a.length() > 0) start = Long.parseLong(a);
+                    if (b.length() > 0) end = Long.parseLong(b);
+                }
+                if (start < 0) start = 0;
+                if (end >= total) end = total - 1;
+                if (start > end) {
+                    sendStatus(socket, 416, "range");
+                    return;
+                }
+            } catch (Throwable t) {
+                start = 0;
+                end = total - 1;
+            }
+        }
+        if (total == 0) {
+            OutputStream empty = socket.getOutputStream();
+            empty.write(("HTTP/1.1 200 OK\r\nContent-Type: " + contentType + "\r\n"
+                    + "Content-Length: 0\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n")
+                    .getBytes("UTF-8"));
+            empty.flush();
+            return;
+        }
+        boolean partial = start > 0 || end < total - 1;
+        long len = end - start + 1;
+        OutputStream out = socket.getOutputStream();
+        String header = "HTTP/1.1 " + (partial ? "206 Partial Content" : "200 OK") + "\r\n"
+                + "Content-Type: " + contentType + "\r\n"
+                + "Content-Length: " + len + "\r\n"
+                + "Accept-Ranges: bytes\r\n"
+                + (partial ? "Content-Range: bytes " + start + "-" + end + "/" + total + "\r\n" : "")
+                + "Content-Disposition: " + (inline ? "inline" : "attachment")
+                + "; filename=\"" + safe + "\""
+                + "; filename*=UTF-8''" + urlEncode(safe) + "\r\n"
+                + "Connection: close\r\n\r\n";
+        out.write(header.getBytes("UTF-8"));
+        if (head) {
+            out.flush();
+            return;
+        }
+        java.io.RandomAccessFile raf = new java.io.RandomAccessFile(f, "r");
+        try {
+            raf.seek(start);
+            byte[] buf = new byte[64 * 1024];
+            long left = len;
+            while (left > 0) {
+                int n = raf.read(buf, 0, (int) Math.min(buf.length, left));
+                if (n <= 0) break;
+                out.write(buf, 0, n);
+                left -= n;
+            }
+            out.flush();
+        } finally {
+            try { raf.close(); } catch (Throwable ignored) {}
+        }
+    }
+
+    private static String headerSafe(String name) {
+        if (name == null || name.length() == 0) return "file";
+        return name.replace("\"", "_").replace("\r", "_").replace("\n", "_");
+    }
+
+    private static String mimeOf(String name) {
+        String n = name == null ? "" : name.toLowerCase(Locale.US);
+        int dot = n.lastIndexOf('.');
+        String ext = dot < 0 ? "" : n.substring(dot + 1);
+        if ("mp4".equals(ext) || "m4v".equals(ext)) return "video/mp4";
+        if ("webm".equals(ext)) return "video/webm";
+        if ("mkv".equals(ext)) return "video/x-matroska";
+        if ("mov".equals(ext)) return "video/quicktime";
+        if ("3gp".equals(ext)) return "video/3gpp";
+        if ("mp3".equals(ext)) return "audio/mpeg";
+        if ("m4a".equals(ext)) return "audio/mp4";
+        if ("aac".equals(ext)) return "audio/aac";
+        if ("wav".equals(ext)) return "audio/wav";
+        if ("ogg".equals(ext) || "oga".equals(ext)) return "audio/ogg";
+        if ("flac".equals(ext)) return "audio/flac";
+        if ("jpg".equals(ext) || "jpeg".equals(ext)) return "image/jpeg";
+        if ("png".equals(ext)) return "image/png";
+        if ("gif".equals(ext)) return "image/gif";
+        if ("webp".equals(ext)) return "image/webp";
+        if ("bmp".equals(ext)) return "image/bmp";
+        if ("svg".equals(ext)) return "image/svg+xml";
+        if ("pdf".equals(ext)) return "application/pdf";
+        if ("txt".equals(ext) || "log".equals(ext) || "md".equals(ext)) return "text/plain; charset=utf-8";
+        if ("html".equals(ext) || "htm".equals(ext)) return "text/html; charset=utf-8";
+        if ("json".equals(ext)) return "application/json";
+        if ("apk".equals(ext)) return "application/vnd.android.package-archive";
+        if ("zip".equals(ext)) return "application/zip";
+        return "application/octet-stream";
     }
 
     private void receiveFile(Socket socket, InputStream in, String name, long length, String guest,
@@ -419,69 +790,175 @@ public class WebShareServer {
             sendStatus(socket, 404, "not found");
             return;
         }
-        long total = f.length();
-        long start = 0;
-        long end = total - 1;
-        if (range != null && range.startsWith("bytes=")) {
-            try {
-                String spec = range.substring(6).split(",")[0].trim();
-                int dash = spec.indexOf('-');
-                if (dash >= 0) {
-                    String a = spec.substring(0, dash).trim();
-                    String b = spec.substring(dash + 1).trim();
-                    if (a.length() > 0) start = Long.parseLong(a);
-                    if (b.length() > 0) end = Long.parseLong(b);
-                }
-                if (start < 0) start = 0;
-                if (end >= total) end = total - 1;
-                if (start > end) {
-                    sendStatus(socket, 416, "range");
-                    return;
-                }
-            } catch (Throwable t) {
-                start = 0;
-                end = total - 1;
-            }
-        }
-        if (total == 0) {
-            // 空文件：直接 200 + 0 长度，别经过 Range 分支（会算出 end=-1 返回 416）
-            OutputStream empty = socket.getOutputStream();
-            empty.write(("HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n"
-                    + "Content-Length: 0\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n")
-                    .getBytes("UTF-8"));
-            empty.flush();
-            return;
-        }
-        boolean partial = start > 0 || end < total - 1;
-        long len = end - start + 1;
+        sendFileBody(socket, f, head, range, "application/octet-stream", false, safe);
+    }
+
+
+    // ---------------- WebDAV 只读 ----------------
+
+    /** OPTIONS：宣告 DAV 级别，Windows/资源管理器靠这个判断能不能挂载。 */
+    private void sendOptions(Socket socket) throws Exception {
         OutputStream out = socket.getOutputStream();
-        String header = "HTTP/1.1 " + (partial ? "206 Partial Content" : "200 OK") + "\r\n"
-                + "Content-Type: application/octet-stream\r\n"
-                + "Content-Length: " + len + "\r\n"
-                + "Accept-Ranges: bytes\r\n"
-                + (partial ? "Content-Range: bytes " + start + "-" + end + "/" + total + "\r\n" : "")
-                + "Content-Disposition: attachment; filename=\"" + safe + "\"\r\n"
+        String header = "HTTP/1.1 200 OK\r\n"
+                + "DAV: 1, 2\r\n"
+                + "MS-Author-Via: DAV\r\n"
+                + "Allow: OPTIONS,GET,HEAD,PROPFIND\r\n"
+                + "Content-Length: 0\r\n"
                 + "Connection: close\r\n\r\n";
         out.write(header.getBytes("UTF-8"));
-        if (head) {
-            out.flush();
+        out.flush();
+    }
+
+    /**
+     * Basic Auth：用户名不校验，密码必须等于设置里的 WebDAV 密码。
+     * Windows 资源管理器不接受空密码，所以空密码一律拒绝。
+     */
+    private boolean davAuthorized(String authHeader) {
+        if (authHeader == null) return false;
+        String h = authHeader.trim();
+        if (h.length() < 6 || !h.substring(0, 6).equalsIgnoreCase("Basic ")) return false;
+        String plain;
+        try {
+            byte[] raw = android.util.Base64.decode(h.substring(6).trim(),
+                    android.util.Base64.DEFAULT);
+            plain = new String(raw, "UTF-8");
+        } catch (Throwable t) {
+            return false;
+        }
+        int colon = plain.indexOf(':');
+        if (colon < 0) return false;
+        String pass = plain.substring(colon + 1);
+        String expected;
+        try {
+            expected = com.jiuyue.lanmesh.core.AppCore.get(ctx).prefs.webdavPassword();
+        } catch (Throwable t) {
+            return false;
+        }
+        if (expected == null || expected.length() == 0) return false;
+        return expected.equals(pass);
+    }
+
+    private void sendAuthRequired(Socket socket) throws Exception {
+        sendStatusEx(socket, 401, "Unauthorized", "authentication required",
+                "WWW-Authenticate: Basic realm=\"Link Mesh\"\r\nDAV: 1, 2\r\n");
+    }
+
+    /** PROPFIND：Depth 0 只回自身，Depth 1（默认）带上直接子项。 */
+    private void sendPropfind(Socket socket, String bare, String depth) throws Exception {
+        File root = browseRoot();
+        String rel = normalizeRel(decodePath(bare));
+        File target = resolveUnder(root, rel);
+        if (target == null) {
+            sendStatus(socket, 403, "forbidden");
             return;
         }
-        java.io.RandomAccessFile raf = new java.io.RandomAccessFile(f, "r");
-        try {
-            raf.seek(start);
-            byte[] buf = new byte[64 * 1024];
-            long left = len;
-            while (left > 0) {
-                int n = raf.read(buf, 0, (int) Math.min(buf.length, left));
-                if (n <= 0) break;
-                out.write(buf, 0, n);
-                left -= n;
-            }
-            out.flush();
-        } finally {
-            try { raf.close(); } catch (Throwable ignored) {}
+        if (!target.exists()) {
+            sendStatus(socket, 404, "not found");
+            return;
         }
+        boolean deep = depth == null || !"0".equals(depth.trim());
+        StringBuilder sb = new StringBuilder(2048);
+        sb.append("<?xml version=\"1.0\" encoding=\"utf-8\"?>\r\n");
+        sb.append("<D:multistatus xmlns:D=\"DAV:\">\r\n");
+        appendDavEntry(sb, root, target);
+        if (deep && target.isDirectory()) {
+            List<File> kids = sortedChildren(target);
+            if (kids != null) {
+                int n = Math.min(kids.size(), LS_LIMIT);
+                for (int i = 0; i < n; i++) {
+                    appendDavEntry(sb, root, kids.get(i));
+                }
+            }
+        }
+        sb.append("</D:multistatus>\r\n");
+        byte[] body = sb.toString().getBytes("UTF-8");
+        OutputStream out = socket.getOutputStream();
+        String header = "HTTP/1.1 207 Multi-Status\r\n"
+                + "Content-Type: application/xml; charset=utf-8\r\n"
+                + "Content-Length: " + body.length + "\r\n"
+                + "DAV: 1, 2\r\n"
+                + "Connection: close\r\n\r\n";
+        out.write(header.getBytes("UTF-8"));
+        out.write(body);
+        out.flush();
+    }
+
+    private void appendDavEntry(StringBuilder sb, File root, File f) {
+        boolean dir = f.isDirectory();
+        String rel = relOf(root, f);
+        String name = rel.length() == 0 ? browseRootLabel(root) : f.getName();
+        sb.append("<D:response><D:href>").append(encodeHref(rel, dir)).append("</D:href>");
+        sb.append("<D:propstat><D:prop>");
+        if (dir) {
+            sb.append("<D:resourcetype><D:collection/></D:resourcetype>");
+        } else {
+            sb.append("<D:resourcetype/>");
+        }
+        sb.append("<D:getcontentlength>").append(dir ? 0L : f.length()).append("</D:getcontentlength>");
+        sb.append("<D:getlastmodified>").append(httpDate(f.lastModified()))
+                .append("</D:getlastmodified>");
+        sb.append("<D:getcontenttype>")
+                .append(xmlEsc(dir ? "httpd/unix-directory" : mimeOf(f.getName())))
+                .append("</D:getcontenttype>");
+        sb.append("<D:displayname>").append(xmlEsc(name)).append("</D:displayname>");
+        sb.append("</D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>\r\n");
+    }
+
+    /** href 用绝对路径 + 逐段百分号编码，中文/空格/加号都不会被客户端误解。 */
+    private static String encodeHref(String rel, boolean dir) {
+        StringBuilder sb = new StringBuilder("/");
+        if (rel != null && rel.length() > 0) {
+            String[] seg = rel.split("/");
+            for (int i = 0; i < seg.length; i++) {
+                if (i > 0) sb.append('/');
+                sb.append(urlEncode(seg[i]));
+            }
+        }
+        if (dir && sb.charAt(sb.length() - 1) != '/') sb.append('/');
+        return sb.toString();
+    }
+
+    private static String urlEncode(String s) {
+        try {
+            return URLEncoder.encode(s, "UTF-8").replace("+", "%20");
+        } catch (Throwable t) {
+            return s;
+        }
+    }
+
+    /** RFC 1123 / HTTP-date，必须是 GMT。 */
+    private static String httpDate(long ms) {
+        SimpleDateFormat f = new SimpleDateFormat("EEE, dd MMM yyyy HH:mm:ss zzz", Locale.US);
+        f.setTimeZone(TimeZone.getTimeZone("GMT"));
+        return f.format(new Date(ms <= 0 ? 0 : ms));
+    }
+
+    private static String xmlEsc(String s) {
+        if (s == null) return "";
+        StringBuilder sb = new StringBuilder(s.length() + 8);
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c == '&') sb.append("&amp;");
+            else if (c == '<') sb.append("&lt;");
+            else if (c == '>') sb.append("&gt;");
+            else if (c == '"') sb.append("&quot;");
+            else if (c == '\'') sb.append("&apos;");
+            else if (c < 0x20) sb.append(' ');
+            else sb.append(c);
+        }
+        return sb.toString();
+    }
+
+    /** 只把「不属于应用自身路由」的路径交给 WebDAV，避免抢掉首页/接口。 */
+    private static boolean isDavPath(String p) {
+        if (p == null || p.length() == 0) return false;
+        if ("/".equals(p) || "/index.html".equals(p) || "/favicon.ico".equals(p)) return false;
+        if (p.startsWith("/api/") || p.startsWith("/upload") || p.startsWith("/text")
+                || p.startsWith("/app.apk") || p.equals("/ls") || p.startsWith("/ls?")) {
+            return false;
+        }
+        if (p.equals("/f") || p.startsWith("/f/")) return false;
+        return true;
     }
 
     private void sendHtml(Socket socket, String html) throws Exception {
@@ -510,11 +987,18 @@ public class WebShareServer {
     }
 
     private void sendStatus(Socket socket, int code, String text) throws Exception {
-        byte[] body = text.getBytes("UTF-8");
+        sendStatusEx(socket, code, "ERROR", text, null);
+    }
+
+    /** 带额外响应头的状态码（401 需要 WWW-Authenticate）。 */
+    private void sendStatusEx(Socket socket, int code, String reason, String text,
+                              String extraHeaders) throws Exception {
+        byte[] body = text == null ? new byte[0] : text.getBytes("UTF-8");
         OutputStream out = socket.getOutputStream();
-        String header = "HTTP/1.1 " + code + " ERROR\r\n"
+        String header = "HTTP/1.1 " + code + " " + reason + "\r\n"
                 + "Content-Type: text/plain; charset=utf-8\r\n"
                 + "Content-Length: " + body.length + "\r\n"
+                + (extraHeaders == null ? "" : extraHeaders)
                 + "Connection: close\r\n\r\n";
         out.write(header.getBytes("UTF-8"));
         out.write(body);
@@ -719,21 +1203,54 @@ public class WebShareServer {
                 + ".acts a{font-size:12px;color:var(--accent);cursor:pointer}"
                 + ".acts a.cancel{color:#e06a6a}"
                 + ".copy{cursor:pointer;word-break:break-word;transition:opacity .15s}"
+                + ".tabs{flex:none;display:flex;gap:8px;padding:10px 16px 2px}"
+                + ".tab{border:1px solid var(--stroke);background:var(--card);color:var(--dim);"
+                + "border-radius:999px;padding:7px 15px;font-size:13px;cursor:pointer;font-family:inherit}"
+                + ".tab.on{background:var(--accent);border-color:transparent;color:var(--on);font-weight:600}"
+                + ".view{display:none;flex:1 1 auto;min-height:0;flex-direction:column}"
+                + ".view.on{display:flex}"
+                + ".fbar{flex:none;display:flex;align-items:center;gap:2px;padding:10px 16px;overflow-x:auto;"
+                + "white-space:nowrap;border-bottom:1px solid var(--stroke)}"
+                + ".fbar::-webkit-scrollbar{display:none}"
+                + ".crumb{font-size:12px;color:var(--accent);cursor:pointer;padding:2px;flex:none}"
+                + ".crumb.cur{color:var(--text);font-weight:600}"
+                + ".csep{font-size:12px;color:var(--dim);flex:none}"
+                + ".flist{flex:1 1 auto;min-height:0;overflow-y:auto;-webkit-overflow-scrolling:touch;"
+                + "padding:4px 10px 28px}"
+                + ".frow{display:flex;align-items:center;gap:10px;padding:10px 8px;"
+                + "border-bottom:1px solid var(--stroke)}"
+                + ".frow:active{background:var(--card)}"
+                + ".fico{flex:none;width:18px;text-align:center;font-size:13px;color:var(--accent)}"
+                + ".fmain{flex:1 1 auto;min-width:0}"
+                + ".fnm{font-size:13.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}"
+                + ".fsub{font-size:11px;color:var(--dim);font-family:ui-monospace,Menlo,Consolas,monospace}"
+                + ".fact{flex:none;display:flex;gap:10px;align-items:center}"
+                + ".fact a{font-size:12px;color:var(--accent);text-decoration:none;padding:3px 2px}"
+                + ".fempty{color:var(--dim);text-align:center;margin-top:40px;font-size:13px;"
+                + "line-height:1.8;padding:0 16px}"
                 + "</style></head><body><div class='app'>"
                 + "<header><div class='dot'></div><div class='who'><h1 id='name'>Link Mesh</h1>"
                 + "<div class='sub' id='sub'>连接中…</div></div>"
                 + "<a class='dl' href='/app.apk' download>下载 App</a></header>"
+                + "<div class='tabs'><button type='button' class='tab on' id='tabChat'>传输</button>"
+                + "<button type='button' class='tab' id='tabFiles'>文件</button></div>"
+                + "<div class='view on' id='vChat'>"
                 + "<div class='msgs' id='msgs'><div class='empty'>还没有消息<br>发一条试试，或点左下角 + 上传文件</div></div>"
                 + "<div class='composer'>"
                 + "<button class='icon' id='btnFile'>+</button>"
                 + "<input type='file' id='f' style='display:none'>"
                 + "<input type='text' id='msg' placeholder='输入消息…'>"
                 + "<button class='send' id='btnSend'>发送</button>"
+                + "</div></div>"
+                + "<div class='view' id='vFiles'>"
+                + "<div class='fbar' id='fbar'></div>"
+                + "<div class='flist' id='flist'><div class='fempty'>正在读取…</div></div>"
                 + "</div></div><script>"
                 + "var G=(function(){var v=localStorage.getItem('lm_guest');"
                 + "if(!v){v='g'+Math.random().toString(36).slice(2,10);localStorage.setItem('lm_guest',v);}return v;})();"
                 + "var Q='?g='+encodeURIComponent(G);"
-                + "function esc(s){return (s||'').replace(/[&<>]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;'}[c];});}"
+                + "function esc(s){s=(s===null||s===undefined)?'':''+s;return s.replace(/[&<>\"']/g,"
+                + "function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',\"'\":'&#39;'}[c];});}"
                 + "function fmt(t){var d=new Date(t);function p(n){return n<10?'0'+n:''+n;}"
                 + "return p(d.getMonth()+1)+'-'+p(d.getDate())+' '+p(d.getHours())+':'+p(d.getMinutes());}"
                 + "function human(b){return b<1024?b+' B':(b<1048576?(b/1024).toFixed(1)+' KB':(b/1048576).toFixed(1)+' MB');}"
@@ -814,6 +1331,62 @@ public class WebShareServer {
                 + "document.getElementById('f').onchange=upload;"
                 + "document.getElementById('btnFile').onclick=function(){document.getElementById('f').click();};"
                 + "document.getElementById('btnSend').onclick=send;"
+                // ---- 文件浏览 ----
+                + "var fb={path:'',root:'文件',items:[],truncated:false};"
+                + "var MEDIA={'3gp':1,mp4:1,m4v:1,webm:1,mkv:1,mov:1,mp3:1,m4a:1,aac:1,ogg:1,oga:1,"
+                + "wav:1,flac:1,jpg:1,jpeg:1,png:1,gif:1,webp:1,bmp:1,svg:1,pdf:1,txt:1,html:1};"
+                + "function elm(id){return document.getElementById(id);}"
+                + "function extOf(n){var i=n.lastIndexOf('.');return i>=0?n.substring(i+1).toLowerCase():'';}"
+                + "function parentOf(p){if(!p)return '';var i=p.lastIndexOf('/');return i<0?'':p.substring(0,i);}"
+                + "function tabTo(name){var chat=(name==='chat');"
+                + "if(chat){elm('vChat').classList.add('on');elm('vFiles').classList.remove('on');"
+                + "elm('tabChat').classList.add('on');elm('tabFiles').classList.remove('on');}"
+                + "else{elm('vFiles').classList.add('on');elm('vChat').classList.remove('on');"
+                + "elm('tabFiles').classList.add('on');elm('tabChat').classList.remove('on');"
+                + "loadDir(fb.path);}}"
+                + "function renderBar(){"
+                + "var html='<a class=\"crumb'+(fb.path?'':' cur')+'\" data-p=\"\">'+esc(fb.root||'根目录')+'</a>';"
+                + "var parts=fb.path?fb.path.split('/'):[];var acc='';"
+                + "for(var i=0;i<parts.length;i++){acc=acc?acc+'/'+parts[i]:parts[i];"
+                + "html+='<span class=\"csep\">/</span><a class=\"crumb'+(i===parts.length-1?' cur':'')+'"
+                + "\" data-p=\"'+esc(acc)+'\">'+esc(parts[i])+'</a>';}"
+                + "elm('fbar').innerHTML=html;}"
+                + "function renderList(){var out='';"
+                + "if(fb.path){out+='<div class=\"frow\" data-up=\"1\"><div class=\"fico\">↑</div>"
+                + "<div class=\"fmain\"><div class=\"fnm\">返回上级</div></div></div>';}"
+                + "for(var i=0;i<fb.items.length;i++){var it=fb.items[i];"
+                + "var p=fb.path?fb.path+'/'+it.name:it.name;"
+                + "if(it.dir){out+='<div class=\"frow\" data-dir=\"'+esc(p)+'\"><div class=\"fico\">▸</div>"
+                + "<div class=\"fmain\"><div class=\"fnm\">'+esc(it.name)+'/</div>"
+                + "<div class=\"fsub\">文件夹 · '+fmt(it.mtime)+'</div></div></div>';}"
+                + "else{var href='/f?path='+encodeURIComponent(p);"
+                + "var play=MEDIA[extOf(it.name)]?'<a href=\"'+href+'&amp;inline=1\" target=\"_blank\" "
+                + "rel=\"noopener\">打开</a>':'';"
+                + "out+='<div class=\"frow\"><div class=\"fico\">·</div><div class=\"fmain\">"
+                + "<div class=\"fnm\">'+esc(it.name)+'</div><div class=\"fsub\">'+human(it.size)"
+                + "+' · '+fmt(it.mtime)+'</div></div><div class=\"fact\"><a href=\"'+href+'\">下载</a>'"
+                + "+play+'</div></div>';}}"
+                + "if(!fb.items.length){out+='<div class=\"fempty\">这个文件夹是空的</div>';}"
+                + "if(fb.truncated){out+='<div class=\"fempty\">只显示前 2000 项</div>';}"
+                + "elm('flist').innerHTML=out;}"
+                + "function loadDir(p){fb.path=p||'';elm('flist').innerHTML='<div class=\"fempty\">正在读取…</div>';"
+                + "fetch('/ls?path='+encodeURIComponent(fb.path)).then(function(r){"
+                + "if(r.status!==200)throw new Error(''+r.status);return r.json();}).then(function(d){"
+                + "fb.path=d.path||'';fb.items=d.items||[];fb.root=d.root||'文件';"
+                + "fb.truncated=!!d.truncated;renderBar();renderList();}).catch(function(){"
+                + "elm('flist').innerHTML='<div class=\"fempty\">读不到这个目录<br>"
+                + "如果是「内部存储」，请先在 App 里授予「所有文件访问」权限</div>';});}"
+                + "function onListClick(e){var t=e.target;"
+                + "while(t&&t!==elm('flist')){if(t.getAttribute){"
+                + "var d=t.getAttribute('data-dir');"
+                + "if(d!==null&&d!==undefined&&d!==''){loadDir(d);return;}"
+                + "if(t.getAttribute('data-up')){loadDir(parentOf(fb.path));return;}}t=t.parentNode;}}"
+                + "elm('tabChat').onclick=function(){tabTo('chat');};"
+                + "elm('tabFiles').onclick=function(){tabTo('files');};"
+                + "elm('flist').addEventListener('click',onListClick);"
+                + "elm('fbar').addEventListener('click',function(e){var t=e.target;"
+                + "while(t&&t!==elm('fbar')){if(t.getAttribute){var p=t.getAttribute('data-p');"
+                + "if(p!==null&&p!==undefined){loadDir(p);return;}}t=t.parentNode;}});"
                 + "refresh();setInterval(refresh,2500);"
                 + "</script></body></html>";
     }

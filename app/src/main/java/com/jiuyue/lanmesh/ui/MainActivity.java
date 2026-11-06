@@ -21,11 +21,15 @@ import androidx.appcompat.app.AppCompatActivity;
 import androidx.appcompat.app.AppCompatDelegate;
 
 import com.jiuyue.lanmesh.R;
+import java.io.File;
+import com.jiuyue.lanmesh.core.History;
+import com.jiuyue.lanmesh.core.ClipSync;
+import com.jiuyue.lanmesh.model.Peer;
+import com.jiuyue.lanmesh.model.ChatMessage;
 import com.jiuyue.lanmesh.core.AppCore;
 import com.jiuyue.lanmesh.core.Bus;
 import com.jiuyue.lanmesh.core.Const;
 import com.jiuyue.lanmesh.core.Util;
-import com.jiuyue.lanmesh.model.Peer;
 import com.jiuyue.lanmesh.net.NetService;
 import com.jiuyue.lanmesh.net.P2pManager;
 
@@ -58,6 +62,7 @@ public class MainActivity extends AppCompatActivity implements Bus.Listener {
     private static final int TAB_LAN = 0;
     private static final int TAB_P2P = 1;
     private static final int TAB_SETTINGS = 2;
+    private static final int TAB_TOOLS = 3;
 
     private AppCore core;
     private PeerAdapter adapter;
@@ -76,6 +81,7 @@ public class MainActivity extends AppCompatActivity implements Bus.Listener {
     private View segSlider;
     private View segTabs;
     private View navLan;
+    private View navTools;
     private View navP2p;
     private View navSettings;
     private ImageView ivLan;
@@ -125,6 +131,7 @@ public class MainActivity extends AppCompatActivity implements Bus.Listener {
     private TextView tvSaveTree;
     private View pageP2p;
     private View pageLan;
+    private View pageTools;
     private View pageSettings;
     private com.jiuyue.lanmesh.ui.AnimSwitch swLanMain;
     private TextView tvLanState;
@@ -188,14 +195,19 @@ public class MainActivity extends AppCompatActivity implements Bus.Listener {
         setupLanPage();
         setupP2pPage();
         setupSettingsPage();
+        setupToolsPage();
         setupPager();
 
         if (currentTab == TAB_P2P && Build.VERSION.SDK_INT < Const.MIN_P2P_API) currentTab = TAB_LAN;
+        checkShareInbox();
+        if (core.prefs.clipSyncEnabled()) applyClipSync(true);
+        askNotificationPermission();
         ensureService();
         ensureLsDiscovery();
         lsTickHandler.postDelayed(lsTick, 15000);
         refresh();
         refreshSettings();
+        refreshTools();
 
         if (AppCore.themeFadeIn) {
             AppCore.themeFadeIn = false;
@@ -336,6 +348,7 @@ public class MainActivity extends AppCompatActivity implements Bus.Listener {
         navLan = findViewById(R.id.nav_lan);
         navP2p = findViewById(R.id.nav_p2p);
         navSettings = findViewById(R.id.nav_settings);
+        navTools = findViewById(R.id.nav_tools);
         ivLan = (ImageView) findViewById(R.id.iv_nav_lan);
         ivP2p = (ImageView) findViewById(R.id.iv_nav_p2p);
         ivSettings = (ImageView) findViewById(R.id.iv_nav_settings);
@@ -372,6 +385,7 @@ public class MainActivity extends AppCompatActivity implements Bus.Listener {
         pageP2p = findViewById(R.id.page_p2p);
         pageLan = findViewById(R.id.page_lan);
         pageSettings = findViewById(R.id.page_settings);
+        pageTools = findViewById(R.id.page_tools);
         pageRow = findViewById(R.id.page_row);
         swLanMain = (com.jiuyue.lanmesh.ui.AnimSwitch) findViewById(R.id.sw_lan_main);
         tvLanState = (TextView) findViewById(R.id.tv_lan_state);
@@ -1453,6 +1467,14 @@ public class MainActivity extends AppCompatActivity implements Bus.Listener {
                 showTab(TAB_SETTINGS);
             }
         });
+        if (navTools != null) {
+            navTools.setOnClickListener(new View.OnClickListener() {
+                @Override
+                public void onClick(View v) {
+                    showTab(TAB_TOOLS);
+                }
+            });
+        }
         navP2p.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
@@ -1538,6 +1560,7 @@ public class MainActivity extends AppCompatActivity implements Bus.Listener {
     private int keyOfNav(View v) {
         if (v.getId() == R.id.nav_lan) return TAB_LAN;
         if (v.getId() == R.id.nav_p2p) return TAB_P2P;
+        if (v.getId() == R.id.nav_tools) return TAB_TOOLS;
         return TAB_SETTINGS;
     }
 
@@ -1570,12 +1593,14 @@ public class MainActivity extends AppCompatActivity implements Bus.Listener {
     private View pageOf(int key) {
         if (key == TAB_LAN) return pageLan;
         if (key == TAB_P2P) return pageP2p;
+        if (key == TAB_TOOLS) return pageTools;
         return pageSettings;
     }
 
     private View navOf(int key) {
         if (key == TAB_LAN) return navLan;
         if (key == TAB_P2P) return navP2p;
+        if (key == TAB_TOOLS) return navTools;
         return navSettings;
     }
 
@@ -1688,6 +1713,7 @@ public class MainActivity extends AppCompatActivity implements Bus.Listener {
         core.prefs.setLastTab(tab);
         AppCore.lastTabMemory = tab;
         currentTab = tab;
+        if (tab == TAB_TOOLS) refreshTools();
         if (pager != null) {
             pager.setPage(indexOfKey(tab), true);
         } else {
@@ -1854,14 +1880,30 @@ public class MainActivity extends AppCompatActivity implements Bus.Listener {
                 return;
             }
             String pid = null;
+            String peerName = "LocalSend 设备";
             com.jiuyue.lanmesh.net.ls.LsDiscovery d = core.lsDiscovery();
             if (d != null) {
                 for (com.jiuyue.lanmesh.net.ls.LsDevice dev : d.snapshot()) {
                     if (dev.host != null && dev.host.equals(remoteIp)) {
                         pid = Peer.LS_PREFIX + dev.fingerprint;
+                        peerName = dev.displayName();
                         break;
                     }
                 }
+            }
+            // 历史先记：即使对端还没被我们发现，用户也应该在传输记录里看到这个文件
+            if (saved != null) {
+                History.Entry he = new History.Entry();
+                he.peerName = peerName;
+                he.peerId = pid;
+                he.fileName = saved.getName();
+                he.size = size > 0 ? size : saved.length();
+                he.ts = System.currentTimeMillis();
+                he.dir = History.DIR_RECV;
+                he.ok = true;
+                he.localPath = saved.getAbsolutePath();
+                History.add(this, he);
+                refreshTools();
             }
             if (pid == null || core.peers.get(pid) == null) {
                 // 对方只发了文件但还没被我们发现：不硬造会话，否则聊天页会打开一个空壳
@@ -2119,6 +2161,7 @@ public class MainActivity extends AppCompatActivity implements Bus.Listener {
                         .setPositiveButton("完成", null)
                         .create();
         dlg.show();
+        Ui.frameAlert(dlg);
         // 二维码在主线程生成会卡一两百毫秒，放后台
         new Thread(new Runnable() {
             @Override
@@ -2244,6 +2287,7 @@ public class MainActivity extends AppCompatActivity implements Bus.Listener {
         try {
             ClipboardManager cm = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
             if (cm != null) {
+                ClipSync.suppressOnce(this, text);
                 cm.setPrimaryClip(ClipData.newPlainText("lanmesh", text));
                 Ui.toast(this, "已复制");
             }
@@ -2714,5 +2758,416 @@ public class MainActivity extends AppCompatActivity implements Bus.Listener {
                 showNextTrust();
             }
         });
+    }
+
+    /** Android 13 起前台服务的通知要用户点头，否则通知不可见、保活效果打折。 */
+    private void askNotificationPermission() {
+        if (Build.VERSION.SDK_INT < 33) return;
+        try {
+            if (checkSelfPermission("android.permission.POST_NOTIFICATIONS")
+                    == android.content.pm.PackageManager.PERMISSION_GRANTED) return;
+            requestPermissions(new String[]{"android.permission.POST_NOTIFICATIONS"}, 9301);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    // ---------------- 工具页 ----------------
+
+    private ListView histList;
+    private HistoryAdapter histAdapter;
+    private android.widget.Switch swToolsDav;
+    private android.widget.Switch swToolsClip;
+    private boolean updatingTools;
+
+    private void setupToolsPage() {
+        if (pageTools == null) return;
+
+        android.widget.Button btnQr = (android.widget.Button) pageTools.findViewById(R.id.btn_tools_web_qr);
+        android.widget.Button btnOpen = (android.widget.Button) pageTools.findViewById(R.id.btn_tools_web_open);
+        if (btnQr != null) {
+            btnQr.setOnClickListener(new View.OnClickListener() {
+                @Override
+                public void onClick(View v) {
+                    showWebQr();
+                }
+            });
+        }
+        if (btnOpen != null) {
+            btnOpen.setOnClickListener(new View.OnClickListener() {
+                @Override
+                public void onClick(View v) {
+                    String url = webUrl();
+                    if (url == null) {
+                        Ui.toast(MainActivity.this, "网页端没在运行，先打开局域网传输");
+                        return;
+                    }
+                    try {
+                        startActivity(new Intent(Intent.ACTION_VIEW, android.net.Uri.parse(url)));
+                    } catch (Throwable t) {
+                        Ui.toast(MainActivity.this, "没有可用的浏览器");
+                    }
+                }
+            });
+        }
+
+        swToolsDav = (android.widget.Switch) pageTools.findViewById(R.id.sw_tools_dav);
+        if (swToolsDav != null) {
+            swToolsDav.setOnCheckedChangeListener(new android.widget.CompoundButton.OnCheckedChangeListener() {
+                @Override
+                public void onCheckedChanged(android.widget.CompoundButton b, boolean checked) {
+                    if (updatingTools) return;
+                    core.prefs.setWebdavEnabled(checked);
+                    refreshTools();
+                    Ui.toast(MainActivity.this, checked
+                            ? "WebDAV 已开启，电脑可映射网络驱动器"
+                            : "WebDAV 已关闭");
+                }
+            });
+        }
+
+        swToolsClip = (android.widget.Switch) pageTools.findViewById(R.id.sw_tools_clip);
+        if (swToolsClip != null) {
+            swToolsClip.setOnCheckedChangeListener(new android.widget.CompoundButton.OnCheckedChangeListener() {
+                @Override
+                public void onCheckedChanged(android.widget.CompoundButton b, boolean checked) {
+                    if (updatingTools) return;
+                    core.prefs.setClipSyncEnabled(checked);
+                    applyClipSync(checked);
+                    refreshTools();
+                }
+            });
+        }
+
+        android.widget.Button clear = (android.widget.Button) pageTools.findViewById(R.id.btn_tools_hist_clear);
+        if (clear != null) {
+            clear.setOnClickListener(new View.OnClickListener() {
+                @Override
+                public void onClick(View v) {
+                    com.jiuyue.lanmesh.ui.Ui.alert(MainActivity.this, "清空传输记录？", null, "清空", new com.jiuyue.lanmesh.ui.Ui.OnClick() {
+                        @Override
+                        public void onClick() {
+                            History.clear(MainActivity.this);
+                            refreshTools();
+                        }
+                    });
+                }
+            });
+        }
+
+        histList = (ListView) pageTools.findViewById(R.id.lv_tools_hist);
+        if (histList != null) {
+            histAdapter = new HistoryAdapter(this, new java.util.ArrayList<History.Entry>());
+            histList.setAdapter(histAdapter);
+            histList.setOnItemClickListener(new android.widget.AdapterView.OnItemClickListener() {
+                @Override
+                public void onItemClick(android.widget.AdapterView<?> p, View v, int pos, long id) {
+                    History.Entry e = (History.Entry) p.getItemAtPosition(pos);
+                    if (e == null) return;
+                    if (e.dir == History.DIR_RECV && e.ok && e.localPath != null) {
+                        openLocal(new File(e.localPath));
+                    } else if (e.dir == History.DIR_SEND && e.peerId != null) {
+                        resendEntry(e);
+                    }
+                }
+            });
+            histList.setOnItemLongClickListener(new android.widget.AdapterView.OnItemLongClickListener() {
+                @Override
+                public boolean onItemLongClick(android.widget.AdapterView<?> p, View v, int pos, long id) {
+                    final History.Entry e = (History.Entry) p.getItemAtPosition(pos);
+                    if (e == null) return false;
+                    com.jiuyue.lanmesh.ui.Ui.alert(MainActivity.this, "删除这条记录？", null, "删除", new com.jiuyue.lanmesh.ui.Ui.OnClick() {
+                        @Override
+                        public void onClick() {
+                            History.remove(MainActivity.this, e.ts);
+                            refreshTools();
+                        }
+                    });
+                    return true;
+                }
+            });
+        }
+    }
+
+    private void refreshTools() {
+        if (pageTools == null) return;
+        android.widget.TextView tvUrl = (android.widget.TextView) pageTools.findViewById(R.id.tv_tools_web_url);
+        if (tvUrl != null) {
+            String url = webUrl();
+            tvUrl.setText(url == null ? "网页端未开启（在局域网页打开开关）" : url);
+        }
+        android.widget.TextView tvDav = (android.widget.TextView) pageTools.findViewById(R.id.tv_tools_dav_url);
+        if (tvDav != null) {
+            String ip = cachedIp != null ? cachedIp : Util.localIpv4(this);
+            NetService s = core.service();
+            int port = s == null ? 0 : s.getWebPort();
+            if (ip == null || port <= 0) {
+                tvDav.setText("服务未启动");
+            } else if (!core.prefs.webdavEnabled()) {
+                tvDav.setText("已关闭 · 打开后可用电脑映射网络驱动器");
+            } else {
+                // WebDAV 与网页共用根路径，靠请求方法区分（PROPFIND 走 DAV、GET 走网页）
+                tvDav.setText("http://" + ip + ":" + port + "/");
+            }
+        }
+        android.widget.TextView davHint = (android.widget.TextView) pageTools.findViewById(R.id.tv_tools_dav_hint);
+        if (davHint != null) {
+            boolean allFiles = Build.VERSION.SDK_INT < 30
+                    || android.os.Environment.isExternalStorageManager();
+            if (allFiles) {
+                davHint.setText("在电脑资源管理器里「映射网络驱动器」，填入上面的地址即可像本地磁盘一样读写。");
+                davHint.setOnClickListener(null);
+            } else {
+                davHint.setText("当前只能浏览应用自己的目录。点这里授予「所有文件访问」，才能在整个存储里浏览和下载。");
+                davHint.setOnClickListener(new View.OnClickListener() {
+                    @Override
+                    public void onClick(View v) {
+                        try {
+                            Intent i = new Intent("android.settings.MANAGE_APP_ALL_FILES_ACCESS_PERMISSION");
+                            i.setData(android.net.Uri.parse("package:" + getPackageName()));
+                            startActivity(i);
+                        } catch (Throwable t) {
+                            Ui.toast(MainActivity.this, "这台机器没有这个设置页");
+                        }
+                    }
+                });
+            }
+        }
+        updatingTools = true;
+        if (swToolsDav != null) swToolsDav.setChecked(core.prefs.webdavEnabled());
+        if (swToolsClip != null) swToolsClip.setChecked(core.prefs.clipSyncEnabled());
+        updatingTools = false;
+        if (histAdapter != null) {
+            java.util.List<History.Entry> data = History.list(this);
+            histAdapter.setData(data);
+            View empty = pageTools.findViewById(R.id.tv_tools_hist_empty);
+            if (empty != null) empty.setVisibility(data.isEmpty() ? View.VISIBLE : View.GONE);
+            if (histList != null) histList.setVisibility(data.isEmpty() ? View.GONE : View.VISIBLE);
+        }
+    }
+
+    private void showWebQr() {
+        final String url = webUrl();
+        if (url == null) {
+            Ui.toast(this, "网页端没在运行，先打开局域网传输");
+            return;
+        }
+        final android.widget.FrameLayout wrap = new android.widget.FrameLayout(this);
+        int pad = Ui.dp(this, 20);
+        wrap.setPadding(pad, pad, pad, pad);
+        final android.widget.ImageView iv = new android.widget.ImageView(this);
+        android.widget.FrameLayout.LayoutParams lp = new android.widget.FrameLayout.LayoutParams(
+                Ui.dp(this, 220), Ui.dp(this, 220));
+        lp.gravity = android.view.Gravity.CENTER;
+        iv.setLayoutParams(lp);
+        wrap.addView(iv);
+        try {
+            iv.setImageBitmap(QrUtil.encode(url, Ui.dp(this, 220)));
+        } catch (Throwable t) {
+            iv.setVisibility(View.GONE);
+        }
+        androidx.appcompat.app.AlertDialog dlg = new androidx.appcompat.app.AlertDialog.Builder(this)
+                .setTitle("手机浏览器扫这个")
+                .setView(wrap)
+                .setMessage(url)
+                .setPositiveButton("关闭", null)
+                .create();
+        dlg.show();
+        Ui.frameAlert(dlg);
+    }
+
+    /** 剪贴板同步开关。只推给已信任且在线的设备，不广播给本网段任何人。 */
+    private void applyClipSync(boolean on) {
+        if (!on) {
+            ClipSync.stop(this);
+            return;
+        }
+        boolean ok = ClipSync.start(this, new ClipSync.Listener() {
+            @Override
+            public void onClipboardText(final String text) {
+                runOnUiThread(new Runnable() {
+                    @Override
+                    public void run() {
+                        pushClipToTrusted(text);
+                    }
+                });
+            }
+        });
+        if (!ok) Ui.toast(this, "剪贴板同步没能启动（部分系统限制后台读取）");
+    }
+
+    private void pushClipToTrusted(String text) {
+        List<Peer> peers = core.peers.list();
+        int sent = 0;
+        for (Peer p : peers) {
+            if (p.deviceId == null) continue;
+            if (!core.prefs.isTrusted(p.deviceId)) continue;
+            if (!p.isOnline(System.currentTimeMillis())) continue;
+            if (p.isLocalSend()) continue;
+            NetService s = core.service();
+            if (s == null) continue;
+            ChatMessage m = new ChatMessage();
+            m.peerDeviceId = p.deviceId;
+            m.direction = ChatMessage.DIR_OUT;
+            m.type = ChatMessage.TYPE_TEXT;
+            m.text = text;
+            m.status = ChatMessage.ST_SENDING;
+            core.messages.append(m);
+            s.sendText(p, m);
+            sent++;
+        }
+        if (sent > 0 && adapter != null) adapter.notifyDataSetChanged();
+    }
+
+    private void openLocal(File f) {
+        if (f == null || !f.exists()) {
+            Ui.toast(this, "文件已不在原位置");
+            return;
+        }
+        try {
+            android.net.Uri u = androidx.core.content.FileProvider.getUriForFile(
+                    this, getPackageName() + ".files", f);
+            Intent i = new Intent(Intent.ACTION_VIEW);
+            i.setDataAndType(u, guessMime(f.getName()));
+            i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_ACTIVITY_NEW_TASK);
+            startActivity(i);
+        } catch (Throwable t) {
+            Ui.toast(this, "没有能打开它的应用");
+        }
+    }
+
+    private void resendEntry(History.Entry e) {
+        Peer p = core.peers.get(e.peerId);
+        if (p == null) {
+            Ui.toast(this, "这台设备已不在列表里");
+            return;
+        }
+        Intent i = new Intent(this, ChatActivity.class);
+        i.putExtra(ChatActivity.EXTRA_PEER_ID, p.deviceId);
+        startActivity(i);
+    }
+
+    private static String guessMime(String name) {
+        String n = name == null ? "" : name.toLowerCase(java.util.Locale.US);
+        if (n.endsWith(".mp4") || n.endsWith(".mkv")) return "video/*";
+        if (n.endsWith(".mp3") || n.endsWith(".m4a") || n.endsWith(".wav")) return "audio/*";
+        if (n.endsWith(".jpg") || n.endsWith(".jpeg") || n.endsWith(".png")
+                || n.endsWith(".webp") || n.endsWith(".gif")) return "image/*";
+        if (n.endsWith(".pdf")) return "application/pdf";
+        if (n.endsWith(".apk")) return "application/vnd.android.package-archive";
+        return "*/*";
+    }
+
+    // ---------------- 分享入口 ----------------
+
+    /**
+     * 一对多：同一个文件同时发给多台设备。
+     * 每台各走一遍正常的 sendFile，所以在各自的会话里都能看到进度和记录，
+     * 不需要为广播单独设计一套状态。
+     */
+    private void broadcastFiles(List<Peer> targets, File[] files) {
+        NetService s = core.service();
+        if (s == null) {
+            Ui.toast(this, "服务未启动");
+            return;
+        }
+        int n = 0;
+        for (Peer p : targets) {
+            if (p.isLocalSend() && core.prefs.encEnabled()) {
+                // LocalSend 只支持明文，加密开着的时候不能发
+                continue;
+            }
+            for (File f : files) {
+                if (f == null || !f.isFile() || f.length() <= 0) continue;
+                ChatMessage m = new ChatMessage();
+                m.peerDeviceId = p.deviceId;
+                m.direction = ChatMessage.DIR_OUT;
+                m.type = ChatMessage.TYPE_FILE;
+                m.fileId = java.util.UUID.randomUUID().toString();
+                m.fileName = Util.safeFileName(f.getName());
+                m.fileSize = f.length();
+                m.status = ChatMessage.ST_SENDING;
+                m.sourcePath = f.getAbsolutePath();
+                core.messages.append(m);
+                s.transfers().sendFile(p, m, android.net.Uri.fromFile(f), f.getAbsolutePath());
+                n++;
+            }
+        }
+        if (n > 0) {
+            Ui.toast(this, "已开始向 " + targets.size() + " 台设备发送");
+            refresh();
+        } else {
+            Ui.toast(this, "没有可发送的文件");
+        }
+    }
+
+    /**
+     * 从系统分享进来的文件已经被 ShareReceiverActivity 落成临时文件，
+     * 这里只负责让用户选一台设备发出去。选完立刻清空目录，
+     * 避免下次启动又弹一遍。
+     */
+    private void checkShareInbox() {
+        final File dir = ShareReceiverActivity.shareDir(this);
+        File[] fs = dir.listFiles();
+        if (fs == null || fs.length == 0) return;
+        final File[] files = fs.clone();
+        java.util.Arrays.sort(files, new java.util.Comparator<File>() {
+            @Override
+            public int compare(File a, File b) {
+                return a.getName().compareTo(b.getName());
+            }
+        });
+        List<Peer> peers = core.peers.list();
+        final List<Peer> online = new java.util.ArrayList<Peer>();
+        long nowMs = System.currentTimeMillis();
+        for (Peer p : peers) if (p.isOnline(nowMs)) online.add(p);
+        if (online.isEmpty()) {
+            Ui.toast(this, "附近还没有在线设备，文件已暂存，等设备上线后再分享一次");
+            return;
+        }
+        final String[] names = new String[online.size() + 1];
+        for (int i = 0; i < online.size(); i++) names[i] = online.get(i).displayName();
+        names[online.size()] = "全部 " + online.size() + " 台设备一起发";
+        androidx.appcompat.app.AlertDialog dlgShare = new androidx.appcompat.app.AlertDialog.Builder(this)
+                .setTitle("发送 " + files.length + " 个文件到")
+                .setItems(names, new android.content.DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(android.content.DialogInterface d, int which) {
+                        if (which >= online.size()) {
+                            broadcastFiles(online, files);
+                            return;
+                        }
+                        Peer p = online.get(which);
+                        java.util.ArrayList<String> paths = new java.util.ArrayList<String>();
+                        for (File f : files) paths.add(f.getAbsolutePath());
+                        Intent i = new Intent(MainActivity.this, ChatActivity.class);
+                        i.putExtra(ChatActivity.EXTRA_PEER_ID, p.deviceId);
+                        i.putStringArrayListExtra(ChatActivity.EXTRA_SEND_FILES, paths);
+                        startActivity(i);
+                    }
+                })
+                .setOnDismissListener(new android.content.DialogInterface.OnDismissListener() {
+                    @Override
+                    public void onDismiss(android.content.DialogInterface d) {
+                        File[] rest = dir.listFiles();
+                        if (rest != null) for (File f : rest) {
+                            try {
+                                f.delete();
+                            } catch (Throwable ignored) {
+                            }
+                        }
+                    }
+                })
+                .create();
+        dlgShare.show();
+        Ui.frameAlert(dlgShare);
+    }
+
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        if (intent != null && intent.getBooleanExtra("from_share", false)) {
+            checkShareInbox();
+        }
     }
 }

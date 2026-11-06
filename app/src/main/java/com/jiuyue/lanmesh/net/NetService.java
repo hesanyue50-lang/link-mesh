@@ -14,9 +14,8 @@ import android.os.Build;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.IBinder;
+import android.content.pm.ServiceInfo;
 import android.util.Log;
-
-import androidx.core.app.NotificationCompat;
 
 import com.jiuyue.lanmesh.App;
 import com.jiuyue.lanmesh.R;
@@ -57,6 +56,10 @@ public class NetService extends Service {
 
     private static final String TAG = "LanMeshService";
     private static final String CH_SERVICE = "lanmesh_service";
+
+    /** 通知副标题状态：null = 空闲（等待连接），否则是「正在发送 xxx · 45%」。 */
+    private volatile String progressText;
+    private volatile int progressPercent = -1;
 
     private static NetService instance;
 
@@ -135,6 +138,7 @@ public class NetService extends Service {
         worker = new Handler(workerThread.getLooper());
         mainHandler = new Handler(getMainLooper());
 
+        createServiceChannel();
         startForegroundCompat();
         scheduleHousekeeping();
         if (prefs.lanEnabled()) {
@@ -149,6 +153,9 @@ public class NetService extends Service {
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
+        // 每次启动都重申前台状态：API 26+ 用 startForegroundService() 拉起时，
+        // 系统要求 5 秒内必须 startForeground()，漏调会直接 ANR/崩溃。
+        startForegroundCompat();
         // START_STICKY：被系统回收后重建，重新开始监听（不恢复传输，传输由 UI 重试）
         return START_STICKY;
     }
@@ -161,6 +168,12 @@ public class NetService extends Service {
     @Override
     public void onDestroy() {
         Log.i(TAG, "service destroying");
+        try {
+            // 前台状态必须先摘掉，否则通知会残留到服务销毁之后
+            stopForeground(true);
+        } catch (Throwable t) {
+            Log.w(TAG, "stopForeground failed", t);
+        }
         releaseKeepAlive();
         if (webShare != null) webShare.stop();
         if (nsd != null) nsd.stop();
@@ -188,6 +201,35 @@ public class NetService extends Service {
 
     // ---------------- 前台通知 ----------------
 
+    /** 创建（或校正）前台服务通知渠道：API 26 以下没有渠道概念，直接跳过。 */
+    private void createServiceChannel() {
+        if (Build.VERSION.SDK_INT < 26) return;
+        try {
+            NotificationManager nm = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+            if (nm == null) return;
+            NotificationChannel old = nm.getNotificationChannel(CH_SERVICE);
+            if (old != null && old.getImportance() == NotificationManager.IMPORTANCE_MIN) {
+                // 早期版本用过 IMPORTANCE_MIN，渠道重要性创建后不能再改，只能删掉重建；
+                // 否则传输进度那行文本在通知栏里根本展不开。
+                nm.deleteNotificationChannel(CH_SERVICE);
+                old = null;
+                Log.i(TAG, "recreate service channel (MIN -> LOW)");
+            }
+            if (old == null) {
+                NotificationChannel ch = new NotificationChannel(CH_SERVICE,
+                        getString(R.string.service_channel_name), NotificationManager.IMPORTANCE_LOW);
+                ch.setDescription(getString(R.string.service_channel_desc));
+                ch.setShowBadge(false);
+                ch.setSound(null, null);
+                ch.enableVibration(false);
+                ch.setLockscreenVisibility(Notification.VISIBILITY_PUBLIC);
+                nm.createNotificationChannel(ch);
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "create service channel failed", t);
+        }
+    }
+
     private void startForegroundCompat() {
         try {
             // 清掉旧 ID 的通知（升级前的缓存），避免继续显示旧图标
@@ -198,38 +240,97 @@ public class NetService extends Service {
                 } catch (Throwable ignored) {
                 }
             }
-            startForeground(Const.NOTIF_ID_SERVICE, buildServiceNotification());
+            Notification n = buildServiceNotification();
+            if (Build.VERSION.SDK_INT >= 34) {
+                // Android 14+ 必须显式带类型（Manifest 里已声明 dataSync）
+                startForeground(Const.NOTIF_ID_SERVICE, n,
+                        ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC);
+            } else {
+                startForeground(Const.NOTIF_ID_SERVICE, n);
+            }
+        } catch (SecurityException se) {
+            // API 34+ 缺权限 / 通知被禁用时会被拒：降级为后台服务继续跑，不能崩
+            Log.w(TAG, "startForeground denied, run as background service", se);
         } catch (Throwable t) {
             Log.w(TAG, "startForeground failed", t);
         }
     }
 
     private Notification buildServiceNotification() {
-        NotificationManager nm = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
-        if (Build.VERSION.SDK_INT >= 26 && nm != null) {
-            NotificationChannel ch = new NotificationChannel(CH_SERVICE,
-                    getString(R.string.service_channel_name), NotificationManager.IMPORTANCE_MIN);
-            ch.setDescription(getString(R.string.service_channel_desc));
-            ch.setShowBadge(false);
-            nm.createNotificationChannel(ch);
-        }
+        createServiceChannel();
         Intent i = new Intent(this, MainActivity.class);
-        PendingIntent pi = PendingIntent.getActivity(this, 0, i,
-                PendingIntent.FLAG_UPDATE_CURRENT | (Build.VERSION.SDK_INT >= 23 ? PendingIntent.FLAG_IMMUTABLE : 0));
-        // 恢复系统标准样式：只保留 smallIcon（通知栏单色是系统硬性要求），
-        // 不再自绘内容——自绘反而会和 vivo 自己画的图标槽位叠成两个图标。
-        NotificationCompat.Builder b = new NotificationCompat.Builder(this, CH_SERVICE)
-                .setSmallIcon(R.drawable.ic_stat_notify)
-                .setColor(getResources().getColor(R.color.accent));
+        i.setFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+        int piFlags = PendingIntent.FLAG_UPDATE_CURRENT
+                | (Build.VERSION.SDK_INT >= 23 ? PendingIntent.FLAG_IMMUTABLE : 0);
+        PendingIntent pi = PendingIntent.getActivity(this, 0, i, piFlags);
 
-        return b
+        Notification.Builder b;
+        if (Build.VERSION.SDK_INT >= 26) {
+            b = new Notification.Builder(this, CH_SERVICE);
+        } else {
+            // API 19-25 没有渠道，重要性只能靠 builder 上的 priority 表达
+            b = new Notification.Builder(this);
+            b.setPriority(Notification.PRIORITY_LOW);
+        }
+        if (Build.VERSION.SDK_INT >= 21) {
+            b.setColor(getResources().getColor(R.color.accent));
+            b.setCategory(Notification.CATEGORY_SERVICE);
+        }
+        // 系统标准样式：只保留 smallIcon（通知栏单色是系统硬性要求），不自绘 RemoteViews，
+        // 否则会和 vivo 自己画的图标槽位叠成两个图标（见 notification_service.xml 的历史问题）。
+        b.setSmallIcon(R.drawable.ic_stat_notify)
                 .setContentTitle(getString(R.string.service_title))
-                .setContentText("服务运行中 · 端口 " + port + " · " + Util.safe(Util.localIpv4(NetService.this)))
+                .setContentText(statusText())
                 .setOngoing(true)
-                .setPriority(NotificationCompat.PRIORITY_MIN)
                 .setOnlyAlertOnce(true)
-                .setContentIntent(pi)
-                .build();
+                .setShowWhen(false)
+                .setContentIntent(pi);
+        if (progressPercent >= 0) {
+            b.setProgress(100, progressPercent, false);
+        }
+        return b.build();
+    }
+
+    /** 通知副标题：空闲时固定「等待连接」，传输中由 updateProgress 覆盖。 */
+    private String statusText() {
+        String t = progressText;
+        return (t == null) ? "等待连接" : t;
+    }
+
+    /**
+     * 传输进度刷新：只更新同一条前台服务通知（Const.NOTIF_ID_SERVICE），不会多出一条。
+     *
+     * @param name    文件名，空则用「文件」兜底
+     * @param percent 0-100，越界自动夹紧
+     * @param sending true=正在发送，false=正在接收
+     */
+    public void updateProgress(String name, int percent, boolean sending) {
+        int p = percent;
+        if (p < 0) p = 0;
+        if (p > 100) p = 100;
+        String n = (name == null) ? "" : name.trim();
+        if (n.length() == 0) n = "文件";
+        progressText = (sending ? "正在发送 " : "正在接收 ") + n + " · " + p + "%";
+        progressPercent = p;
+        notifyStatus();
+    }
+
+    /** 传输结束或取消后回到「等待连接」。 */
+    public void updateIdle() {
+        progressText = null;
+        progressPercent = -1;
+        notifyStatus();
+    }
+
+    private void notifyStatus() {
+        try {
+            NotificationManager nm = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+            if (nm == null) return;
+            nm.notify(Const.NOTIF_ID_SERVICE, buildServiceNotification());
+        } catch (Throwable t) {
+            // 通知被禁用（POST_NOTIFICATIONS 被拒）时 notify 会失败，不能影响传输本身
+            Log.w(TAG, "notify status failed", t);
+        }
     }
 
     /**

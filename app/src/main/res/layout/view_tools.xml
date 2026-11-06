@@ -1,0 +1,257 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:id="@+id/tools_root"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:paddingLeft="20dp"
+    android:paddingRight="20dp"
+    android:paddingTop="12dp">
+
+    <TextView
+        android:id="@+id/tv_tools_title"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="工具"
+        style="@style/TextDisplay" />
+
+    <TextView
+        android:id="@+id/tv_tools_sub"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="6dp"
+        android:text="同一网段内的网页收发、WebDAV 挂载与剪贴板同步"
+        style="@style/TextCaption" />
+
+    <!-- 卡片 1：局域网网页 -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="14dp"
+        android:background="@drawable/bg_panel"
+        android:orientation="vertical"
+        android:padding="14dp">
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="局域网网页"
+            style="@style/TextTitle2" />
+
+        <TextView
+            android:id="@+id/tv_tools_web_url"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="5dp"
+            android:lineSpacingExtra="2dp"
+            android:text="http://192.168.0.0:8080"
+            android:textColor="@color/text_dim"
+            android:textIsSelectable="true"
+            android:textSize="11sp"
+            android:typeface="monospace" />
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:orientation="horizontal">
+
+            <Button
+                android:id="@+id/btn_tools_web_qr"
+                style="@style/GhostButton"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:gravity="center"
+                android:text="显示二维码"
+                android:textSize="13sp" />
+
+            <Button
+                android:id="@+id/btn_tools_web_open"
+                style="@style/PrimaryButton"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_marginLeft="8dp"
+                android:layout_weight="1"
+                android:gravity="center"
+                android:text="打开网页"
+                android:textSize="13sp" />
+        </LinearLayout>
+    </LinearLayout>
+
+    <!-- 卡片 2：WebDAV -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="12dp"
+        android:background="@drawable/bg_panel"
+        android:orientation="vertical"
+        android:padding="14dp">
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:gravity="center_vertical"
+            android:orientation="horizontal">
+
+            <ImageView
+                android:layout_width="28dp"
+                android:layout_height="28dp"
+                android:background="@drawable/bg_circle_ghost"
+                android:padding="6dp"
+                android:src="@drawable/ic_tools_dav"
+                android:tint="@color/text_dim"
+                app:tint="@color/text_dim" />
+
+            <TextView
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_marginLeft="10dp"
+                android:layout_weight="1"
+                android:text="WebDAV"
+                style="@style/TextTitle2" />
+        </LinearLayout>
+
+        <TextView
+            android:id="@+id/tv_tools_dav_url"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="6dp"
+            android:lineSpacingExtra="2dp"
+            android:text="http://192.168.0.0:8080/dav"
+            android:textColor="@color/text_dim"
+            android:textIsSelectable="true"
+            android:textSize="11sp"
+            android:typeface="monospace" />
+
+        <Switch
+            android:id="@+id/sw_tools_dav"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:text="开启 WebDAV"
+            android:textColor="@color/text"
+            android:textSize="13sp" />
+
+        <TextView
+            android:id="@+id/tv_tools_dav_hint"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="2dp"
+            android:lineSpacingExtra="3dp"
+            android:text="在电脑资源管理器里「映射网络驱动器」，填入上面的地址即可像本地磁盘一样读写。"
+            android:textColor="@color/text_faint"
+            android:textSize="11sp" />
+    </LinearLayout>
+
+    <!-- 卡片 3：剪贴板同步 -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="12dp"
+        android:background="@drawable/bg_panel"
+        android:orientation="vertical"
+        android:padding="14dp">
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:gravity="center_vertical"
+            android:orientation="horizontal">
+
+            <ImageView
+                android:layout_width="28dp"
+                android:layout_height="28dp"
+                android:background="@drawable/bg_circle_ghost"
+                android:padding="6dp"
+                android:src="@drawable/ic_tools_clip"
+                android:tint="@color/text_dim"
+                app:tint="@color/text_dim" />
+
+            <TextView
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_marginLeft="10dp"
+                android:layout_weight="1"
+                android:text="剪贴板同步"
+                style="@style/TextTitle2" />
+        </LinearLayout>
+
+        <Switch
+            android:id="@+id/sw_tools_clip"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:text="自动同步剪贴板"
+            android:textColor="@color/text"
+            android:textSize="13sp" />
+
+        <TextView
+            android:id="@+id/tv_tools_clip_hint"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="2dp"
+            android:lineSpacingExtra="3dp"
+            android:text="同网段信任设备间复制即推送；内容会经过网络，敏感信息慎用，默认关闭。"
+            android:textColor="@color/text_faint"
+            android:textSize="11sp" />
+    </LinearLayout>
+
+    <!-- 传输记录标题行 -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="16dp"
+        android:gravity="center_vertical"
+        android:orientation="horizontal">
+
+        <TextView
+            android:id="@+id/tv_tools_hist_title"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="传输记录"
+            style="@style/TextTitle2" />
+
+        <Button
+            android:id="@+id/btn_tools_hist_clear"
+            android:layout_width="wrap_content"
+            android:layout_height="36dp"
+            android:background="@drawable/bg_btn_ghost"
+            android:gravity="center"
+            android:minHeight="0dp"
+            android:minWidth="0dp"
+            android:paddingLeft="14dp"
+            android:paddingRight="14dp"
+            android:text="清空"
+            android:textColor="@color/text_dim"
+            android:textSize="12sp" />
+    </LinearLayout>
+
+    <!-- 列表占满剩余空间：外层固定，列表自己滚，避免嵌套滚动 -->
+    <FrameLayout
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_marginTop="4dp"
+        android:layout_weight="1">
+
+        <ListView
+            android:id="@+id/lv_tools_hist"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:clipToPadding="false"
+            android:paddingBottom="88dp"
+            android:scrollbars="none" />
+
+        <TextView
+            android:id="@+id/tv_tools_hist_empty"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:gravity="center"
+            android:text="还没有传输记录"
+            android:textColor="@color/text_faint"
+            android:textSize="12sp"
+            android:visibility="gone" />
+    </FrameLayout>
+</LinearLayout>

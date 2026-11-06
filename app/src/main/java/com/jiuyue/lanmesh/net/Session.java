@@ -532,6 +532,7 @@ public class Session implements Runnable {
             msg.progress = 100;
             store.update(msg);
             Bus.post(Bus.MESSAGE_UPDATED, msg);
+            recordHistory(msg, true, null, peer);
             Bus.toast("已接收 " + target.getName());
             transfer.notifyDone("已接收 " + target.getName());
             try {
@@ -634,6 +635,26 @@ public class Session implements Runnable {
         if (n.endsWith(".txt")) return "text/plain";
         return "application/octet-stream";
     }
+
+    /** 接收侧历史。文件落在哪个绝对路径也要记，历史项点一下就能打开。 */
+    private void recordHistory(ChatMessage msg, boolean ok, String error, Peer peer) {
+        try {
+            if (msg == null || msg.type != ChatMessage.TYPE_FILE) return;
+            com.jiuyue.lanmesh.core.History.Entry e = new com.jiuyue.lanmesh.core.History.Entry();
+            e.peerName = peer == null ? "?" : peer.displayName();
+            e.peerId = peer == null ? null : peer.deviceId;
+            e.fileName = msg.fileName;
+            e.size = msg.fileSize;
+            e.ts = System.currentTimeMillis();
+            e.dir = com.jiuyue.lanmesh.core.History.DIR_RECV;
+            e.ok = ok;
+            e.error = error;
+            e.localPath = msg.localPath;
+            com.jiuyue.lanmesh.core.History.add(ctx, e);
+        } catch (Throwable ignored) {
+        }
+    }
+
 
     private File getReceiveDir() {
         File dir = com.jiuyue.lanmesh.core.StorageUtil.downloadDir(ctx);

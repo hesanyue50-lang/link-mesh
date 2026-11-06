@@ -23,7 +23,7 @@ android {
         //   debug 用时间戳（分钟粒度）自动递增：同一个号反复装会被系统拒装，
         //   而开发期间一天要装十几次。正式包装走 release.sh 的 -Pvc= 覆盖。
         versionCode project.hasProperty("vc") ? project.property("vc").toInteger() : (int) (System.currentTimeMillis() / 60000L)
-        versionName '1.7.0'
+        versionName '1.8.0'
         // 底部导航用 Lucide 矢量图标；API 19 上由 AppCompat 负责解析
         vectorDrawables.useSupportLibrary = true
         ndk { abiFilters 'arm64-v8a', 'armeabi-v7a' }

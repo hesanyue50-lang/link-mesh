@@ -287,6 +287,7 @@ public final class NavManager {
     }
 
     private static String nameOf(int key) {
+        if (key == 3) return "工具";
         if (key == 0) return "局域网";
         if (key == 1) return "P2P";
         return "设置";

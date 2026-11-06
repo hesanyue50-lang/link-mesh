@@ -103,4 +103,5 @@
     <string name="nearby_count">%1$d 台</string>
     <string name="p2p_retry">重新检测</string>
     <string name="p2p_stage2_hint">阶段二将使用 WebRTC + 可配置公共 STUN + 手动信令（二维码 / 复制粘贴）；不引入 TURN，打洞 15 秒失败即明确提示，不会无限重试。</string>
+    <string name="tab_tools">工具</string>
 </resources>

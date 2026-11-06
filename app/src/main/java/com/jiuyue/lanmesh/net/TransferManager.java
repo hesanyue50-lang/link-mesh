@@ -173,6 +173,26 @@ public class TransferManager {
      * @param uri  通过 ACTION_GET_CONTENT 拿到的 Uri（可为 null，若 path 有效）
      * @param path 本地真实路径（可为 null，若 uri 有效）
      */
+    /** 传输历史：失败的成功的一起记，用户才能知道上次为什么没发出去。 */
+    private void recordHistory(Peer peer, ChatMessage msg) {
+        try {
+            if (msg == null || msg.type != ChatMessage.TYPE_FILE) return;
+            com.jiuyue.lanmesh.core.History.Entry e = new com.jiuyue.lanmesh.core.History.Entry();
+            e.peerName = peer == null ? "?" : peer.displayName();
+            e.peerId = peer == null ? null : peer.deviceId;
+            e.fileName = msg.fileName;
+            e.size = msg.fileSize;
+            e.ts = System.currentTimeMillis();
+            e.dir = com.jiuyue.lanmesh.core.History.DIR_SEND;
+            e.ok = msg.status == ChatMessage.ST_DONE;
+            e.error = msg.error;
+            e.localPath = msg.sourcePath;
+            e.batchId = msg.msgId;
+            com.jiuyue.lanmesh.core.History.add(ctx, e);
+        } catch (Throwable ignored) {
+        }
+    }
+
     public void sendFile(final Peer peer, final ChatMessage msg, final Uri uri, final String path) {
         final Job job = new Job(msg.fileId, msg, msg.fileSize);
         register(job);
@@ -546,6 +566,7 @@ public class TransferManager {
             msg.speed = 0;
             store.update(msg);
             Bus.post(Bus.MESSAGE_UPDATED, msg);
+            recordHistory(peer, msg);
             Bus.toast("已发送 " + msg.fileName);
         } catch (InterruptedException e) {
             msg.status = ChatMessage.ST_CANCELLED;
@@ -560,6 +581,7 @@ public class TransferManager {
             msg.speed = 0;
             store.update(msg);
             Bus.post(Bus.MESSAGE_UPDATED, msg);
+            recordHistory(peer, msg);
             Bus.toast("发送失败：" + failReason);
         } finally {
             Util.closeQuietly(in);

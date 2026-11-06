@@ -33,6 +33,9 @@ public class Prefs {
     private static final String K_HIDE_P2P = "hide_p2p";
     private static final String K_P2P_LAST = "p2p_last";
     private static final String K_WEB_SHARE = "web_share_enabled";
+    private static final String K_WEBDAV_PASS = "webdav_pass";
+    private static final String K_WEBDAV_ON = "webdav_enabled";
+    private static final String K_CLIP_SYNC = "clip_sync_enabled";
     private static final String K_HOME_TAB = "home_tab";
 
     private final SharedPreferences sp;
@@ -195,20 +198,25 @@ public class Prefs {
         sp.edit().putBoolean(K_LAN_ENABLED, v).apply();
     }
 
-    /** 页面顺序（0=局域网 1=P2P 2=设置），缺省补全。 */
+    /** 页面顺序（0=局域网 1=P2P 2=设置 3=工具），缺省补全。 */
     public java.util.List<Integer> pageOrder() {
-        String s = sp.getString(K_PAGE_ORDER, "0,1,2");
+        String s = sp.getString(K_PAGE_ORDER, "0,1,3,2");
         java.util.List<Integer> out = new java.util.ArrayList<Integer>();
         if (s != null) {
             for (String part : s.split(",")) {
                 try {
                     int k = Integer.parseInt(part.trim());
-                    if (k >= 0 && k <= 2 && !out.contains(k)) out.add(k);
+                    if (k >= 0 && k <= 3 && !out.contains(k)) out.add(k);
                 } catch (Throwable ignored) {
                 }
             }
         }
-        for (int k = 0; k < 3; k++) if (!out.contains(k)) out.add(k);
+        // 老版本存的是 "0,1,2"，补上工具页时插到设置前面，而不是甩到最后
+        if (!out.contains(3)) {
+            int at = out.indexOf(2);
+            if (at >= 0) out.add(at, 3); else out.add(3);
+        }
+        for (int k = 0; k < 4; k++) if (!out.contains(k)) out.add(k);
         return out;
     }
 
@@ -228,7 +236,7 @@ public class Prefs {
             for (String part : s.split(",")) {
                 try {
                     int k = Integer.parseInt(part.trim());
-                    if (k >= 0 && k <= 2) out.add(k);
+                    if (k >= 0 && k <= 3) out.add(k);
                 } catch (Throwable ignored) {
                 }
             }
@@ -269,6 +277,34 @@ public class Prefs {
 
     public void setP2pLast(boolean v) {
         sp.edit().putBoolean(K_P2P_LAST, v).apply();
+    }
+
+    /** WebDAV 只读端点的密码。Windows 资源管理器不接受空密码，所以给个默认值。 */
+    public String webdavPassword() {
+        String v = sp.getString(K_WEBDAV_PASS, null);
+        if (v == null || v.length() == 0) return "linkmesh";
+        return v;
+    }
+
+    public void setWebdavPassword(String v) {
+        sp.edit().putString(K_WEBDAV_PASS, v == null ? "" : v.trim()).apply();
+    }
+
+    public boolean webdavEnabled() {
+        return sp.getBoolean(K_WEBDAV_ON, false);
+    }
+
+    public void setWebdavEnabled(boolean v) {
+        sp.edit().putBoolean(K_WEBDAV_ON, v).apply();
+    }
+
+    /** 剪贴板自动同步：默认关，复制的内容会推给信任设备，属敏感功能。 */
+    public boolean clipSyncEnabled() {
+        return sp.getBoolean(K_CLIP_SYNC, false);
+    }
+
+    public void setClipSyncEnabled(boolean v) {
+        sp.edit().putBoolean(K_CLIP_SYNC, v).apply();
     }
 
     public boolean autoAcceptFiles() {

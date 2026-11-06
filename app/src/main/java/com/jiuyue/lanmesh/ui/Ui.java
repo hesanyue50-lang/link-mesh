@@ -297,6 +297,24 @@ public final class Ui {
      *  - 底部操作表：从下方 60dp 滑入 + 淡入
      * 只做入场，关闭仍然即时——用户点"取消/知道了"时不需要等待。
      */
+    /**
+     * AlertDialog 走 alertDialogTheme，而那个主题把 windowBackground 设成了透明，
+     * 于是 Builder 弹出来的框没有卡片背景（文字看得见、二维码就露馅了）。
+     * 这里补一层圆角卡片，并用 InsetDrawable 内缩，避免内容顶到圆角。
+     */
+    public static void frameAlert(androidx.appcompat.app.AlertDialog d) {
+        if (d == null) return;
+        try {
+            Window w = d.getWindow();
+            if (w == null) return;
+            android.graphics.drawable.Drawable card =
+                    d.getContext().getResources().getDrawable(R.drawable.bg_panel);
+            w.setBackgroundDrawable(new android.graphics.drawable.InsetDrawable(
+                    card, dp(d.getContext(), 8)));
+        } catch (Throwable ignored) {
+        }
+    }
+
     public static void animateDialogIn(Dialog d, boolean fromBottom) {
         if (d == null) return;
         Window w = d.getWindow();

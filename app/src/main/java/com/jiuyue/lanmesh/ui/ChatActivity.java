@@ -48,9 +48,12 @@ import java.util.UUID;
 public class ChatActivity extends AppCompatActivity implements Bus.Listener {
 
     public static final String EXTRA_PEER_ID = "peer_id";
+    /** 从系统分享进来时，这里是一批本地临时文件的绝对路径 */
+    public static final String EXTRA_SEND_FILES = "send_files";
 
     private static final int REQ_PICK_FILE = 4201;
     private static final int REQ_PICK_IMAGE = 4202;
+    private static final int REQ_PICK_DIR = 4203;
     private static final int REQ_STORAGE = 4203;
 
     private AppCore core;
@@ -100,6 +103,19 @@ public class ChatActivity extends AppCompatActivity implements Bus.Listener {
         if (peer != null) {
             ((TextView) findViewById(R.id.tv_peer_name)).setText(peer.displayName());
             adapter.setData(core.messages.load(peer.deviceId));
+        }
+
+        // 分享进来的文件：界面铺好之后再发，否则进度条找不到宿主
+        final java.util.ArrayList<String> queued =
+                getIntent() == null ? null : getIntent().getStringArrayListExtra(EXTRA_SEND_FILES);
+        if (queued != null && !queued.isEmpty() && peer != null) {
+            getIntent().removeExtra(EXTRA_SEND_FILES);
+            listView.postDelayed(new Runnable() {
+                @Override
+                public void run() {
+                    sendQueued(queued, 0);
+                }
+            }, 700);
         }
 
         findViewById(R.id.btn_back).setOnClickListener(new View.OnClickListener() {
@@ -252,6 +268,7 @@ public class ChatActivity extends AppCompatActivity implements Bus.Listener {
         Ui.sheet(this, new String[]{
                 getString(R.string.pick_file),
                 getString(R.string.pick_image),
+                "打包发送文件夹",
                 "发送本应用安装包"
         }, new Ui.OnClick[]{
                 new Ui.OnClick() {
@@ -264,6 +281,12 @@ public class ChatActivity extends AppCompatActivity implements Bus.Listener {
                     @Override
                     public void onClick() {
                         pickWithPermission("image/*", REQ_PICK_IMAGE);
+                    }
+                },
+                new Ui.OnClick() {
+                    @Override
+                    public void onClick() {
+                        pickDir();
                     }
                 },
                 new Ui.OnClick() {
@@ -334,6 +357,11 @@ public class ChatActivity extends AppCompatActivity implements Bus.Listener {
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
         if (resultCode != RESULT_OK || data == null) return;
+        if (requestCode == REQ_PICK_DIR) {
+            Uri tree = data.getData();
+            if (tree != null) packDirAndSend(tree);
+            return;
+        }
         if (requestCode != REQ_PICK_FILE && requestCode != REQ_PICK_IMAGE) return;
         Uri uri = data.getData();
         if (uri == null) return;
@@ -370,6 +398,76 @@ public class ChatActivity extends AppCompatActivity implements Bus.Listener {
             }
         }
         sendFile(uri, name, size);
+    }
+
+    private void pickDir() {
+        Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
+        i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+        try {
+            startActivityForResult(Intent.createChooser(i, "选择要发送的文件夹"), REQ_PICK_DIR);
+        } catch (Throwable t) {
+            Ui.toast(this, "这个系统没有文件夹选择器");
+        }
+    }
+
+    /**
+     * 打包在后台做，完成后交给普通的文件发送路径。
+     * 目录大时可能要几十秒，所以必须给可见反馈，否则用户会以为没反应。
+     */
+    private void packDirAndSend(final Uri tree) {
+        if (peer == null) return;
+        Ui.toast(this, "正在打包文件夹…");
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                java.io.File tmp = new java.io.File(getCacheDir(), "dirpack");
+                if (!tmp.exists()) tmp.mkdirs();
+                final java.io.File zip = new java.io.File(tmp,
+                        "folder-" + System.currentTimeMillis() + ".zip");
+                try {
+                    com.jiuyue.lanmesh.core.DirZip.pack(ChatActivity.this, tree, zip, null);
+                } catch (Throwable t) {
+                    try {
+                        zip.delete();
+                    } catch (Throwable ignored) {
+                    }
+                    runOnUiThread(new Runnable() {
+                        @Override
+                        public void run() {
+                            Ui.toast(ChatActivity.this, "打包失败，换一个文件夹试试");
+                        }
+                    });
+                    return;
+                }
+                runOnUiThread(new Runnable() {
+                    @Override
+                    public void run() {
+                        if (zip.length() <= 0) {
+                            Ui.toast(ChatActivity.this, "这个文件夹是空的");
+                            return;
+                        }
+                        sendFile(Uri.fromFile(zip), zip.getName(), zip.length(), zip.getAbsolutePath());
+                    }
+                });
+            }
+        }, "lanmesh-dirpack").start();
+    }
+
+    /** 一次分享多个文件时串行发，中间留间隔让上一笔把连接让出来。 */
+    private void sendQueued(final java.util.ArrayList<String> list, final int idx) {
+        if (idx < 0 || idx >= list.size()) return;
+        java.io.File f = new java.io.File(list.get(idx));
+        if (f.exists() && f.length() > 0) {
+            sendFile(Uri.fromFile(f), f.getName(), f.length(), f.getAbsolutePath());
+        }
+        if (idx + 1 < list.size()) {
+            listView.postDelayed(new Runnable() {
+                @Override
+                public void run() {
+                    sendQueued(list, idx + 1);
+                }
+            }, 600);
+        }
     }
 
     private void sendFile(Uri uri, String name, long size) {
