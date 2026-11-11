@@ -291,6 +291,8 @@ public class WebShareServer {
                     boolean inline = "1".equals(param(path, "inline"));
                     sendBrowsed(socket, fp, "HEAD".equals(method), rangeHeader, inline);
                 } else {
+                    // 下载聊天里收到的文件也要凭据：整机浏览加了密码，这条漏着等于留了个后门
+                    if (!requireBrowseAuth(socket, authHeader, path)) return;
                     sendFile(socket, param(path, "name"), "HEAD".equals(method), rangeHeader);
                 }
             } else if ("GET".equals(method) && bare.equals("/upload/size")) {
@@ -1541,7 +1543,9 @@ public class WebShareServer {
                 + "wrap.querySelector('.pause').onclick=function(){if(st.xhr){st.paused=true;st.xhr.abort();st.xhr=null;this.textContent='继续';ui('已暂停 '+(st.off/1048576).toFixed(1)+' MB');}"
                 + "else{st.paused=false;this.textContent='暂停';ui('继续下载…');next();}};"
                 + "wrap.querySelector('.cancel').onclick=function(){st.cancel=true;if(st.xhr){st.xhr.abort();st.xhr=null;}wrap.remove();};"
-                + "fetch('/f?name='+encodeURIComponent(name),{method:'HEAD'}).then(function(r){st.total=parseInt(r.headers.get('Content-Length')||'0',10);"
+                + "fetch('/f?name='+encodeURIComponent(name)+TK(),{method:'HEAD',headers:authH()}).then(function(r){"
+                + "if(r.status===401){if(askPw()){ui('已保存密码，请重新点击下载');}else{ui('需要密码');}return;}"
+                + "st.total=parseInt(r.headers.get('Content-Length')||'0',10);"
                 + "if(!st.total){ui('无法获取文件大小');return;}ui('0 / '+(st.total/1048576).toFixed(1)+' MB',0);next();}).catch(function(){ui('下载失败');});}"
                 + "document.getElementById('msgs').addEventListener('click',function(e){var t=e.target;"
                 + "if(t&&t.className&&t.className.indexOf('fdl')>=0){download(t.getAttribute('data-n'));}});"
