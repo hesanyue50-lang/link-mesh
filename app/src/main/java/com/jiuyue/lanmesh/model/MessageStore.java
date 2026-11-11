@@ -12,7 +12,9 @@ import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
+import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.io.OutputStream;
 import java.io.OutputStreamWriter;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -63,7 +65,17 @@ public class MessageStore {
                     if (o != null) list.add(ChatMessage.fromJson(o));
                 }
             } catch (Throwable t) {
+                // 文件损坏：先留一份原样副本再继续，绝不把这个空列表当成权威数据缓存起来。
+                // 原来直接 cache.put(空list)，用户随手发一条消息就把整份记录覆盖没了。
                 Log.w(TAG, "load messages failed: " + f, t);
+                try {
+                    File bad = new File(dir, f.getName() + ".corrupt-"
+                            + System.currentTimeMillis());
+                    copyFile(f, bad);
+                } catch (Throwable ignored) {
+                }
+                corrupt.put(peerId, Boolean.TRUE);
+                return new ArrayList<ChatMessage>(list);
             } finally {
                 close(r);
             }
@@ -72,8 +84,67 @@ public class MessageStore {
         return new ArrayList<ChatMessage>(list);
     }
 
+    /** 文件读坏过的会话：下次写之前再试一次，别用空列表覆盖别人 */
+    private final java.util.Map<String, Boolean> corrupt =
+            new java.util.HashMap<String, Boolean>();
+
+    /** 重新解析一次；成功则清掉损坏标记并写进缓存，仍失败返回 null。 */
+    private List<ChatMessage> tryReload(String peerId) {
+        File f = fileFor(peerId);
+        if (!f.isFile()) {
+            corrupt.remove(peerId);
+            return new ArrayList<ChatMessage>();
+        }
+        List<ChatMessage> list = new ArrayList<ChatMessage>();
+        BufferedReader r = null;
+        try {
+            r = new BufferedReader(new InputStreamReader(new FileInputStream(f), "UTF-8"));
+            StringBuilder sb = new StringBuilder();
+            String line;
+            while ((line = r.readLine()) != null) sb.append(line);
+            JSONArray arr = new JSONArray(sb.toString());
+            for (int i = 0; i < arr.length(); i++) {
+                JSONObject o = arr.optJSONObject(i);
+                if (o != null) list.add(ChatMessage.fromJson(o));
+            }
+        } catch (Throwable t) {
+            return null;
+        } finally {
+            close(r);
+        }
+        corrupt.remove(peerId);
+        cache.put(peerId, list);
+        return list;
+    }
+
+    private void copyFile(File src, File dst) {
+        InputStream in = null;
+        OutputStream out = null;
+        try {
+            in = new FileInputStream(src);
+            out = new FileOutputStream(dst);
+            byte[] buf = new byte[8192];
+            int n;
+            while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+            out.flush();
+        } catch (Throwable ignored) {
+        } finally {
+            close(in);
+            close(out);
+        }
+    }
+
     public synchronized void append(ChatMessage msg) {
         if (msg == null || msg.peerDeviceId == null) return;
+        // 文件读坏过的会话：写之前再试着解析一次。仍失败就保留 .corrupt 副本，
+        // 宁可这次写不进去，也不能拿半截列表把原记录整份覆盖掉。
+        if (corrupt.containsKey(msg.peerDeviceId)) {
+            List<ChatMessage> recovered = tryReload(msg.peerDeviceId);
+            if (recovered == null) {
+                Log.w(TAG, "refuse to overwrite corrupt store: " + msg.peerDeviceId);
+                return;
+            }
+        }
         List<ChatMessage> list = cache.get(msg.peerDeviceId);
         if (list == null) {
             list = load(msg.peerDeviceId);
@@ -158,16 +229,22 @@ public class MessageStore {
                 }
             });
             for (ChatMessage m : ordered) arr.put(m.toJson());
-            w = new OutputStreamWriter(new FileOutputStream(tmp), "UTF-8");
+            FileOutputStream fos = new FileOutputStream(tmp);
+            w = new OutputStreamWriter(fos, "UTF-8");
             w.write(arr.toString());
             w.flush();
+            try {
+                fos.getFD().sync();   // 不 sync 的话断电后可能只剩 .tmp
+            } catch (Throwable ignored) {
+            }
             w.close();
             w = null;
-            if (target.exists() && !target.delete()) {
-                Log.w(TAG, "cannot delete old message file");
-            }
+            // 同目录 rename 是原子的，可以直接覆盖。"先删后改名"只要在两步之间被杀，
+            // 就会连原文件一起消失（只剩 .tmp，而 load 只认 .json）。
             if (!tmp.renameTo(target)) {
                 Log.w(TAG, "rename message file failed");
+                if (target.exists()) target.delete();
+                if (!tmp.renameTo(target)) Log.w(TAG, "rename retry failed");
             }
         } catch (Throwable t) {
             Log.w(TAG, "persist messages failed", t);

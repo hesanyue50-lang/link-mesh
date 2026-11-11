@@ -199,15 +199,27 @@ public class MainActivity extends AppCompatActivity implements Bus.Listener {
         setupPager();
 
         if (currentTab == TAB_P2P && Build.VERSION.SDK_INT < Const.MIN_P2P_API) currentTab = TAB_LAN;
-        checkShareInbox();
         if (core.prefs.clipSyncEnabled()) applyClipSync(true);
-        askNotificationPermission();
         ensureService();
         ensureLsDiscovery();
         lsTickHandler.postDelayed(lsTick, 15000);
         refresh();
         refreshSettings();
         refreshTools();
+        // 分享进来的文件必须等服务与发现流程起来再弹设备列表：
+        // 原来在 ensureService 之前调用，冷启动时设备列表必然是空的，
+        // 只会得到一句"附近还没有在线设备"，然后没有任何重发入口。
+        pendingShareText = takeShareText();
+        if (hasPendingShare() || pendingShareText != null) {
+            pageRow.postDelayed(new Runnable() {
+                @Override
+                public void run() {
+                    if (isFinishing() || isDestroyed()) return;
+                    checkShareText();
+                    checkShareInbox();
+                }
+            }, 2500);
+        }
 
         if (AppCore.themeFadeIn) {
             AppCore.themeFadeIn = false;
@@ -307,6 +319,12 @@ public class MainActivity extends AppCompatActivity implements Bus.Listener {
         if (lan != null) {
             lan.setPadding(lan.getPaddingLeft(), lan.getPaddingTop(),
                     lan.getPaddingRight(), px);
+        }
+        // 工具页根是 LinearLayout，垫根布局会把列表压矮，只调列表自己的底部留白
+        android.view.View toolsHist = findViewById(R.id.lv_tools_hist);
+        if (toolsHist != null) {
+            toolsHist.setPadding(toolsHist.getPaddingLeft(), toolsHist.getPaddingTop(),
+                    toolsHist.getPaddingRight(), px);
         }
         int[] scrollPages = new int[]{R.id.page_p2p, R.id.page_settings};
         for (int id : scrollPages) {
@@ -1509,13 +1527,10 @@ public class MainActivity extends AppCompatActivity implements Bus.Listener {
             // 关键顺序：必须在 View 布局前就把目标页交给 PanelPager
             // （pageWidth==0 时它会记为 pendingPage）。放到 post 里会与
             // onSizeChanged 的 scrollTo(0) 竞争，表现为重建后跳回第一页。
-            pager.setPage(currentTab, false);
-            pager.post(new Runnable() {
-                @Override
-                public void run() {
-                    applyNavConfig();
-                }
-            });
+            // currentTab 是 key（0=局域网 1=P2P 2=设置 3=工具），而 XML 里页面顺序是
+            // 局域网/P2P/工具/设置 —— key 2 和 3 正好与索引相反。原来把 key 当索引传进去，
+            // 转屏或冷启动后会停在错误的页。顺序必须先由 applyNavConfig 重建，再按索引定位。
+            applyNavConfig(false);
         }
     }
 
@@ -1606,6 +1621,10 @@ public class MainActivity extends AppCompatActivity implements Bus.Listener {
 
     /** 按「顺序 + 隐藏」重建页面容器和底部导航；滑块按可见数重新等分。 */
     private void applyNavConfig() {
+        applyNavConfig(true);
+    }
+
+    private void applyNavConfig(boolean animate) {
         if (segTabs == null || pageRow == null) return;
         android.widget.LinearLayout row = (android.widget.LinearLayout) pageRow;
         android.widget.LinearLayout tabs = (android.widget.LinearLayout) segTabs;
@@ -1619,7 +1638,7 @@ public class MainActivity extends AppCompatActivity implements Bus.Listener {
         }
         if (pager != null) pager.setPage(indexOfKey(currentTab), false);
         layoutSlider(); // 先滚到目标页再算滑块，否则会先用旧偏移算一帧
-        if (segWrap != null) {
+        if (animate && segWrap != null) {
             segWrap.animate().cancel();
             segWrap.setAlpha(0.55f);
             segWrap.setTranslationY(Ui.dp(this, 6));
@@ -1746,6 +1765,9 @@ public class MainActivity extends AppCompatActivity implements Bus.Listener {
             if (!p2pProbed) runP2pProbe();
         } else if (key == TAB_SETTINGS) {
             refreshSettings();
+        } else if (key == TAB_TOOLS) {
+            // 工具页是滑动也能到的，只在点导航项时刷新会让记录一直是旧的
+            refreshTools();
         } else {
             refresh();
         }
@@ -1765,6 +1787,8 @@ public class MainActivity extends AppCompatActivity implements Bus.Listener {
         if (hasFocus) {
             layoutSlider();
             layoutThemeSlider();
+            // Android 10+ 后台读不到剪贴板，回到前台补读一次
+            if (core.prefs.clipSyncEnabled()) ClipSync.pollNow();
         }
     }
 
@@ -1794,6 +1818,10 @@ public class MainActivity extends AppCompatActivity implements Bus.Listener {
                 });
             }
         }, "lanmesh-ip").start();
+        // onPause 里移除了 lsTick，回前台不补投的话 LocalSend 发现就永久停摆
+        lsTickHandler.removeCallbacks(lsTick);
+        lsTickHandler.postDelayed(lsTick, 1000);
+        refreshTools(); // 从系统设置页授权回来，提示文案要跟着变
         syncP2pUi();
         requestNotificationPermission();
     }
@@ -1813,6 +1841,9 @@ public class MainActivity extends AppCompatActivity implements Bus.Listener {
             try { themeAnim.cancel(); } catch (Throwable ignored) {}
             themeAnim = null;
         }
+        // ClipSync.listener 是静态字段，不主动停会一直持有这个已经销毁的 Activity，
+        // 转屏后旧实例还在往信任设备推剪贴板
+        if (isFinishing()) ClipSync.stop(this);
         super.onDestroy();
     }
 
@@ -1872,8 +1903,21 @@ public class MainActivity extends AppCompatActivity implements Bus.Listener {
         }
     }
 
-    private void handleLsIncoming(String remoteIp, String fileName, long size,
-                                  java.io.File saved, String error) {
+    private void handleLsIncoming(final String remoteIp, final String fileName, final long size,
+                                  final java.io.File saved, final String error) {
+        // LsServer 在自己的线程池里回调，这里直接动 View 会抛 CalledFromWrongThreadException，
+        // 被下面的 catch 吞掉后连"写会话 + 提示"都跑不到 —— 现象是文件收到了但聊天里没有
+        runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                if (isFinishing() || isDestroyed()) return;
+                handleLsIncomingUi(remoteIp, fileName, size, saved, error);
+            }
+        });
+    }
+
+    private void handleLsIncomingUi(final String remoteIp, final String fileName, final long size,
+                                    final java.io.File saved, final String error) {
         try {
             if (error != null) {
                 Bus.toast("LocalSend: " + error);
@@ -2914,7 +2958,9 @@ public class MainActivity extends AppCompatActivity implements Bus.Listener {
             boolean allFiles = Build.VERSION.SDK_INT < 30
                     || android.os.Environment.isExternalStorageManager();
             if (allFiles) {
-                davHint.setText("在电脑资源管理器里「映射网络驱动器」，填入上面的地址即可像本地磁盘一样读写。");
+                davHint.setText("在电脑资源管理器里「映射网络驱动器」，填上面的地址，"
+                        + "用户名随意，密码 " + core.prefs.webdavPassword()
+                        + "。只能浏览和下载，不能写入。");
                 davHint.setOnClickListener(null);
             } else {
                 davHint.setText("当前只能浏览应用自己的目录。点这里授予「所有文件访问」，才能在整个存储里浏览和下载。");
@@ -2960,11 +3006,6 @@ public class MainActivity extends AppCompatActivity implements Bus.Listener {
         lp.gravity = android.view.Gravity.CENTER;
         iv.setLayoutParams(lp);
         wrap.addView(iv);
-        try {
-            iv.setImageBitmap(QrUtil.encode(url, Ui.dp(this, 220)));
-        } catch (Throwable t) {
-            iv.setVisibility(View.GONE);
-        }
         androidx.appcompat.app.AlertDialog dlg = new androidx.appcompat.app.AlertDialog.Builder(this)
                 .setTitle("手机浏览器扫这个")
                 .setView(wrap)
@@ -2973,6 +3014,25 @@ public class MainActivity extends AppCompatActivity implements Bus.Listener {
                 .create();
         dlg.show();
         Ui.frameAlert(dlg);
+        // 220dp 的二维码在主线程画要一两百毫秒，低端机会明显顿一下
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                final android.graphics.Bitmap bm;
+                try {
+                    bm = QrUtil.encode(url, Ui.dp(MainActivity.this, 220));
+                } catch (Throwable t) {
+                    return;
+                }
+                runOnUiThread(new Runnable() {
+                    @Override
+                    public void run() {
+                        if (isFinishing() || isDestroyed()) return;
+                        iv.setImageBitmap(bm);
+                    }
+                });
+            }
+        }, "lanmesh-qr").start();
     }
 
     /** 剪贴板同步开关。只推给已信任且在线的设备，不广播给本网段任何人。 */
@@ -3105,6 +3165,73 @@ public class MainActivity extends AppCompatActivity implements Bus.Listener {
      * 这里只负责让用户选一台设备发出去。选完立刻清空目录，
      * 避免下次启动又弹一遍。
      */
+    /** 纯文本分享进来的内容（浏览器/笔记的"分享到"），等主界面起来再问发给谁 */
+    private String pendingShareText;
+
+    private String takeShareText() {
+        try {
+            Intent it = getIntent();
+            if (it == null) return null;
+            String t = it.getStringExtra("from_share_text");
+            if (t != null) it.removeExtra("from_share_text");
+            if (t == null) return null;
+            t = t.trim();
+            return t.length() == 0 ? null : t;
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    /** 文本分享：选一台在线设备，把内容带进聊天页的输入框 */
+    private void checkShareText() {
+        final String text = pendingShareText;
+        pendingShareText = null;
+        if (text == null || text.length() == 0) return;
+        List<Peer> peers = core.peers.list();
+        final List<Peer> online = new java.util.ArrayList<Peer>();
+        long nowMs = System.currentTimeMillis();
+        for (Peer p : peers) if (p.isOnline(nowMs)) online.add(p);
+        if (online.isEmpty()) {
+            // 没有在线设备：别把内容丢掉，放进剪贴板让用户自己粘
+            try {
+                android.content.ClipboardManager cm = (android.content.ClipboardManager)
+                        getSystemService(CLIPBOARD_SERVICE);
+                if (cm != null) {
+                    cm.setPrimaryClip(android.content.ClipData.newPlainText("share", text));
+                }
+            } catch (Throwable ignored) {
+            }
+            Ui.toast(this, "没有在线设备，分享的文字已复制到剪贴板");
+            return;
+        }
+        String[] names = new String[online.size()];
+        for (int i = 0; i < online.size(); i++) names[i] = online.get(i).displayName();
+        androidx.appcompat.app.AlertDialog dlg = new androidx.appcompat.app.AlertDialog.Builder(this)
+                .setTitle("把这段文字发给")
+                .setItems(names, new android.content.DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(android.content.DialogInterface d, int which) {
+                        Peer p = online.get(which);
+                        Intent i = new Intent(MainActivity.this, ChatActivity.class);
+                        i.putExtra(ChatActivity.EXTRA_PEER_ID, p.deviceId);
+                        i.putExtra(ChatActivity.EXTRA_DRAFT_TEXT, text);
+                        startActivity(i);
+                    }
+                })
+                .create();
+        dlg.show();
+        Ui.frameAlert(dlg);
+    }
+
+    private boolean hasPendingShare() {
+        try {
+            File[] fs = ShareReceiverActivity.shareDir(this).listFiles();
+            return fs != null && fs.length > 0;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
     private void checkShareInbox() {
         final File dir = ShareReceiverActivity.shareDir(this);
         File[] fs = dir.listFiles();
@@ -3145,18 +3272,9 @@ public class MainActivity extends AppCompatActivity implements Bus.Listener {
                         startActivity(i);
                     }
                 })
-                .setOnDismissListener(new android.content.DialogInterface.OnDismissListener() {
-                    @Override
-                    public void onDismiss(android.content.DialogInterface d) {
-                        File[] rest = dir.listFiles();
-                        if (rest != null) for (File f : rest) {
-                            try {
-                                f.delete();
-                            } catch (Throwable ignored) {
-                            }
-                        }
-                    }
-                })
+                // 选中设备后由发送侧负责这些临时文件，这里绝不能删：
+                // ChatActivity 是延迟 700ms 才去读的，广播也是异步起的线程，
+                // 原来 dismiss 里一律删光，导致分享发送 100% 发不出去
                 .create();
         dlgShare.show();
         Ui.frameAlert(dlgShare);
@@ -3167,6 +3285,8 @@ public class MainActivity extends AppCompatActivity implements Bus.Listener {
         super.onNewIntent(intent);
         setIntent(intent);
         if (intent != null && intent.getBooleanExtra("from_share", false)) {
+            pendingShareText = takeShareText();
+            checkShareText();
             checkShareInbox();
         }
     }

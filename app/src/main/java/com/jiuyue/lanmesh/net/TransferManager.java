@@ -323,7 +323,7 @@ public class TransferManager {
         return shaCache;
     }
 
-    private void shaCachePut(String key, String value) {
+    private synchronized void shaCachePut(String key, String value) {
         java.util.Map<String, String> map = shaCache();
         map.put(key, value);
         if (map.size() > SHA_CACHE_MAX) {
@@ -373,13 +373,19 @@ public class TransferManager {
     }
 
     private void doSendFile(Peer peer, ChatMessage msg, Uri uri, String path, Job job) {
+        retainTemp(path);
         // LocalSend 对端不跑我们的帧协议，走它的 HTTP API（明文 HTTP，无法加密）
         if (peer != null && peer.isLocalSend()) {
             if (prefs.encEnabled()) {
+                releaseTemp(path);
                 throw new IllegalStateException(
                         "已开启传输加密，但 LocalSend 设备只支持明文传输。要发给它请先关闭加密");
             }
-            sendViaLocalSend(peer, msg, uri, path, job);
+            try {
+                sendViaLocalSend(peer, msg, uri, path, job);
+            } finally {
+                releaseTemp(path);
+            }
             return;
         }
         Socket socket = null;
@@ -401,7 +407,9 @@ public class TransferManager {
             socket = new Socket();
             job.socket = socket;
             socket.connect(new InetSocketAddress(peer.host, peer.port), Const.SOCKET_TIMEOUT_MS);
-            socket.setSoTimeout(Const.SOCKET_TIMEOUT_MS);
+            // 握手与"是否接收"确认阶段，对端可能在等用户点弹窗（最长 TRUST_WAIT_MS=60s）。
+            // 这里只给 15 秒的话，对方点"允许"慢一点就必失败。拿到 FILE_ACCEPT 后再调回来。
+            socket.setSoTimeout((int) (Const.TRUST_WAIT_MS + 5000));
             socket.setSendBufferSize(256 * 1024);
             Protocol.Reader reader = new Protocol.Reader(socket.getInputStream());
             Protocol.Writer writer = new Protocol.Writer(socket.getOutputStream());
@@ -447,6 +455,8 @@ public class TransferManager {
                 if (System.currentTimeMillis() > deadline) throw new IllegalStateException("等待接收确认超时");
             }
 
+            socket.setSoTimeout(Const.SOCKET_TIMEOUT_MS); // 数据阶段恢复 15 秒
+
             // 4) 流式发送。断点续传时先跳过已确认的整块。
             in = openInput(uri, path);
             int chunk = Const.CHUNK_SIZE;
@@ -459,14 +469,20 @@ public class TransferManager {
                 while (startChunk < totalChunks && received.get(startChunk)) startChunk++;
                 skipped = (long) startChunk * chunk;
                 long remain = skipped;
+                byte[] skipBuf = new byte[64 * 1024];
                 while (remain > 0) {
                     long n = in.skip(remain);
                     if (n <= 0) {
-                        if (in.read() < 0) break;
-                        n = 1;
+                        // 有些 provider 的流 skip() 恒返回 0。原来退化成一次读 1 字节，
+                        // 断点续传 2GB 就要几百万次系统调用，界面像卡死。
+                        int want = (int) Math.min(skipBuf.length, remain);
+                        int r = in.read(skipBuf, 0, want);
+                        if (r < 0) break;
+                        n = r;
                     }
                     remain -= n;
                 }
+                if (remain > 0) throw new IllegalStateException("源文件读取不完整，无法续传");
             }
             job.bytes = skipped;
             long sent = skipped;
@@ -515,9 +531,11 @@ public class TransferManager {
                     } catch (Throwable ignored) {
                     }
                 }
-                int n = in.read(buf);
+                // 必须读满一块再用 index 定位写入。原来一次 read 可能只回 30KB，
+                // 接收端按 index*chunkSize 落盘，中间就留出一个空洞，
+                // 而且位图还标成已收到 —— 大文件永远校验失败、永远从头重传。
+                int n = readFull(in, buf);
                 if (n < 0) break;
-                if (n == 0) continue;
                 writer.writeChunk(index, buf, 0, n);
                 sent += n;
                 index++;
@@ -593,7 +611,74 @@ public class TransferManager {
             }
             unregister(job);
             updateNotification(job, "发送", msg.fileName);
+            // 分享落盘 / 目录打包产生的临时文件：不论成功失败都回收。
+            // 用引用计数是因为一对多广播时同一个文件会被并发发多次。
+            releaseTemp(path);
         }
+    }
+
+    /** 同一个临时文件可能被多台设备并发发送（一对多广播） */
+    private static final java.util.Map<String, Integer> TEMP_REFS =
+            new java.util.concurrent.ConcurrentHashMap<String, Integer>();
+
+    private static void retainTemp(String path) {
+        if (path == null) return;
+        synchronized (TEMP_REFS) {
+            Integer n = TEMP_REFS.get(path);
+            TEMP_REFS.put(path, n == null ? 1 : n + 1);
+        }
+    }
+
+    /** 引用减到 0 才真删。否则第一台发完就把文件删了，其余几台 FileNotFoundException。 */
+    private void releaseTemp(String path) {
+        if (path == null || path.length() == 0) return;
+        synchronized (TEMP_REFS) {
+            Integer n = TEMP_REFS.get(path);
+            if (n == null) return;
+            if (n > 1) {
+                TEMP_REFS.put(path, n - 1);
+                return;
+            }
+            TEMP_REFS.remove(path);
+        }
+        recycleTemp(path);
+    }
+
+    /** 只删我们自己产生的临时副本，用户的原文件绝不碰。 */
+    private void recycleTemp(String path) {
+        if (path == null || path.length() == 0) return;
+        try {
+            File f = new File(path);
+            File parent = f.getParentFile();
+            if (parent == null) return;
+            String pn = parent.getCanonicalPath();
+            java.util.List<File> dirs = new java.util.ArrayList<File>();
+            dirs.add(new File(ctx.getCacheDir(), "share_in"));
+            dirs.add(new File(ctx.getCacheDir(), "dirpack"));
+            File ext = ctx.getExternalCacheDir();
+            if (ext != null) dirs.add(new File(ext, "share_in"));
+            for (File d : dirs) {
+                try {
+                    if (pn.equals(d.getCanonicalPath())) {
+                        f.delete();
+                        return;
+                    }
+                } catch (Throwable ignored) {
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /** 尽量读满整个缓冲，只有文件尾才允许短。 */
+    private static int readFull(java.io.InputStream in, byte[] buf) throws java.io.IOException {
+        int off = 0;
+        while (off < buf.length) {
+            int r = in.read(buf, off, buf.length - off);
+            if (r < 0) break;
+            off += r;
+        }
+        return off == 0 ? -1 : off;
     }
 
     private String describe(Throwable t) {

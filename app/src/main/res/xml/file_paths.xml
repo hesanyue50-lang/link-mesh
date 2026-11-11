@@ -3,4 +3,8 @@
     <external-files-path name="received" path="LanMesh/" />
     <files-path name="internal" path="." />
     <cache-path name="cache" path="." />
+    <!-- 分享进来的文件落在 getExternalCacheDir()，缺这条会导致聊天页打不开它们 -->
+    <external-cache-path name="ext_cache" path="." />
+    <!-- API<=28 时下载目录可能落在公共 Download 下，缺这条会 Failed to find configured root -->
+    <external-path name="pub_download" path="Download/LanMesh/" />
 </paths>

@@ -212,6 +212,8 @@ public final class Util {
         if (slash >= 0) base = base.substring(slash + 1);
         base = base.replaceAll("[\\\\/:*?\"<>|\\r\\n\\t]", "_").trim();
         if (base.length() == 0) base = "file";
+        // '.' / '..' 本身没有非法字符，但拼成 new File(dir, "..") 就是父目录
+        if (".".equals(base) || "..".equals(base)) base = "file";
         if (base.length() > 120) {
             int dot = base.lastIndexOf('.');
             if (dot > 0) {

@@ -152,6 +152,7 @@ public final class Ui {
             if (width > dp(a, 420)) width = dp(a, 420);
             w.setLayout(width, ViewGroup.LayoutParams.WRAP_CONTENT);
         }
+        if (a.isFinishing() || a.isDestroyed()) return d;
         d.show();
         animateDialogIn(d, false);
         if (withInput) {
@@ -402,6 +403,7 @@ public final class Ui {
             w.setAttributes(lp);
             w.setLayout(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         }
+        if (a.isFinishing() || a.isDestroyed()) return d;
         d.show();
         animateDialogIn(d, true);
         return d;

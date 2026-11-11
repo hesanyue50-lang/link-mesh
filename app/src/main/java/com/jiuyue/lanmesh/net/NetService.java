@@ -130,9 +130,13 @@ public class NetService extends Service {
         transfer = new TransferManager(this, prefs, store, peers);
         core.attachService(this);
 
-        // 注意：等待信任确认的握手会阻塞线程最多 60 秒。用固定 4 线程时，
-// 连续几个未确认连接就能把池占满，正常传输只能排队到超时。
-        connPool = Executors.newCachedThreadPool();
+        // 等待信任确认的握手会阻塞线程最多 60 秒：固定 4 线程会被几个未确认连接占满，
+        // 但换成无上限的缓存池同样不行 —— 同网段随便建几百个连接就能把线程数打爆。
+        // 这里用 8~48 的弹性池 + 有界队列，超出直接拒绝。
+        connPool = new java.util.concurrent.ThreadPoolExecutor(8, MAX_INCOMING, 60L,
+                java.util.concurrent.TimeUnit.SECONDS,
+                new java.util.concurrent.LinkedBlockingQueue<Runnable>(MAX_INCOMING * 2),
+                new java.util.concurrent.ThreadPoolExecutor.AbortPolicy());
         workerThread = new HandlerThread("lanmesh-worker");
         workerThread.start();
         worker = new Handler(workerThread.getLooper());
@@ -193,6 +197,12 @@ public class NetService extends Service {
         synchronized (pendingFiles) {
             for (FileRequest f : pendingFiles.values()) f.latch.countDown();
             pendingFiles.clear();
+        }
+        // 心跳循环是无限自投的，不清掉的话服务销毁后主线程还每 5 秒跑一次，
+        // 而且持有已销毁的 Service 实例
+        try {
+            mainHandler.removeCallbacksAndMessages(null);
+        } catch (Throwable ignored) {
         }
         if (instance == this) instance = null;
         AppCore.get(this).attachService(null);
@@ -410,6 +420,11 @@ public class NetService extends Service {
         t.start();
     }
 
+    /** 同时处理的入站连接上限 */
+    private static final int MAX_INCOMING = 48;
+    private final java.util.concurrent.Semaphore connSlots =
+            new java.util.concurrent.Semaphore(MAX_INCOMING);
+
     private void acceptLoop() {
         while (server != null && !server.isClosed()) {
             Socket s = null;
@@ -418,7 +433,11 @@ public class NetService extends Service {
                 s.setTcpNoDelay(true);
                 // 读超时由 Session 构造函数统一设置（Const.SOCKET_TIMEOUT_MS）
                 final Socket incoming = s;
-                connPool.execute(new Session(NetService.this, incoming, prefs, store, peers, transfer,
+                if (!connSlots.tryAcquire()) {
+                    Util.closeQuietly(incoming); // 并发已满：别让它占着 fd 排队
+                    continue;
+                }
+                final Session session = new Session(NetService.this, incoming, prefs, store, peers, transfer,
                         new Session.TrustGate() {
                             @Override
                             public boolean askTrust(String deviceId, String nickname, String host) {
@@ -430,7 +449,22 @@ public class NetService extends Service {
                             public boolean askAccept(String deviceId, String fileName, long size) {
                                 return NetService.this.askFileAccept(deviceId, fileName, size);
                             }
-                        }));
+                        });
+                try {
+                    connPool.execute(new Runnable() {
+                        @Override
+                        public void run() {
+                            try {
+                                session.run();
+                            } finally {
+                                connSlots.release();
+                            }
+                        }
+                    });
+                } catch (java.util.concurrent.RejectedExecutionException rej) {
+                    connSlots.release();
+                    Util.closeQuietly(incoming);
+                }
             } catch (Throwable t) {
                 if (server != null && !server.isClosed()) {
                     Log.w(TAG, "accept failed", t);
@@ -519,6 +553,8 @@ public class NetService extends Service {
         worker.postDelayed(new Runnable() {
             @Override
             public void run() {
+                // 用户可能在这 5 秒里关掉了开关：关了就绝不能再把组播拉起来
+                if (!prefs.lanEnabled() || instance != NetService.this) return;
                 if (!multicastStarted && !peers.hasOnlinePeer()) {
                     startMulticast("NSD 5 秒无邻居");
                 } else if (!multicastStarted) {
@@ -553,6 +589,7 @@ public class NetService extends Service {
                     mainHandler.postDelayed(new Runnable() {
                         @Override
                         public void run() {
+                            if (!prefs.lanEnabled() || instance != NetService.this) return;
                             startMulticast("retry " + multicastRetry);
                         }
                     }, 10000);
@@ -612,6 +649,24 @@ public class NetService extends Service {
         wakeLock = null;
     }
 
+        /**
+     * Android 15 起 dataSync 类型的前台服务每天有累计时长上限，到点必须自己停，
+     * 否则系统按"未在超时内停止前台服务"判 ANR。
+     */
+    @Override
+    public void onTimeout(int startId, int fgsType) {
+        Log.w(TAG, "foreground service timeout, stopping");
+        try {
+            Bus.toast("后台保活已达系统上限，重新打开应用即可恢复");
+        } catch (Throwable ignored) {
+        }
+        try {
+            updateIdle();
+        } catch (Throwable ignored) {
+        }
+        stopSelf();
+    }
+
     /** 任务被划掉后 1 秒重新拉起服务，避免用户"清理后台"就彻底失联。 */
     @Override
     public void onTaskRemoved(Intent rootIntent) {
@@ -627,8 +682,11 @@ public class NetService extends Service {
                     ? PendingIntent.getForegroundService(this, 101, i, flags)
                     : PendingIntent.getService(this, 101, i, flags);
             long at = System.currentTimeMillis() + 1000;
+            // 不能用 setExactAndAllowWhileIdle：它需要 SCHEDULE_EXACT_ALARM，
+            // Android 12+ 上必抛 SecurityException，被下面的 catch 吞掉后服务再也拉不起来。
+            // 这里本来也不需要精确时间。
             if (Build.VERSION.SDK_INT >= 23) {
-                am.setExactAndAllowWhileIdle(android.app.AlarmManager.RTC_WAKEUP, at, pi);
+                am.setAndAllowWhileIdle(android.app.AlarmManager.RTC_WAKEUP, at, pi);
             } else {
                 am.set(android.app.AlarmManager.RTC_WAKEUP, at, pi);
             }
@@ -668,6 +726,15 @@ public class NetService extends Service {
             if (prefs.webShareEnabled() && webShare == null) startWebShare();
             acquireKeepAlive();
             startPortMapping();
+            // LocalSend 兼容层同样属于"局域网传输"，开关打开时也要拉起来
+            try {
+                com.jiuyue.lanmesh.core.AppCore c = com.jiuyue.lanmesh.core.AppCore.get(this);
+                com.jiuyue.lanmesh.net.ls.LsServer ls = c.lsServer();
+                if (ls != null && !ls.isRunning()) ls.start();
+                com.jiuyue.lanmesh.net.ls.LsDiscovery lsd = c.lsDiscovery();
+                if (lsd != null) lsd.start();
+            } catch (Throwable ignored) {
+            }
         } else {
             if (nsd != null) {
                 nsd.stop();
@@ -678,7 +745,18 @@ public class NetService extends Service {
                 beacon = null;
             }
             multicastStarted = false; // 否则下次打开局域网时 startMulticast 直接 return
+            multicastRetry = 0;
             PortMapper.stopRenew();   // 别让续约线程在关闭后继续打路由器
+            // LocalSend 层原来完全不受这个开关控制：关掉之后 53317 还在收文件、
+            // 还在对外宣告、还持有 MulticastLock。用户以为关了，其实没关。
+            try {
+                com.jiuyue.lanmesh.core.AppCore c = com.jiuyue.lanmesh.core.AppCore.get(this);
+                com.jiuyue.lanmesh.net.ls.LsServer ls = c.lsServer();
+                if (ls != null) ls.stop();
+                com.jiuyue.lanmesh.net.ls.LsDiscovery lsd = c.lsDiscovery();
+                if (lsd != null) lsd.stop();
+            } catch (Throwable ignored) {
+            }
             if (webShare != null) {
                 webShare.stop();
                 webShare = null;

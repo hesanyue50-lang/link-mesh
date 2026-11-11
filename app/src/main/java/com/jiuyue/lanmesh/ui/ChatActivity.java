@@ -50,10 +50,12 @@ public class ChatActivity extends AppCompatActivity implements Bus.Listener {
     public static final String EXTRA_PEER_ID = "peer_id";
     /** 从系统分享进来时，这里是一批本地临时文件的绝对路径 */
     public static final String EXTRA_SEND_FILES = "send_files";
+    /** 从系统分享进来的纯文本：预填输入框，由用户确认后自己发 */
+    public static final String EXTRA_DRAFT_TEXT = "draft_text";
 
     private static final int REQ_PICK_FILE = 4201;
     private static final int REQ_PICK_IMAGE = 4202;
-    private static final int REQ_PICK_DIR = 4203;
+    private static final int REQ_PICK_DIR = 4204;
     private static final int REQ_STORAGE = 4203;
 
     private AppCore core;
@@ -108,6 +110,13 @@ public class ChatActivity extends AppCompatActivity implements Bus.Listener {
         // 分享进来的文件：界面铺好之后再发，否则进度条找不到宿主
         final java.util.ArrayList<String> queued =
                 getIntent() == null ? null : getIntent().getStringArrayListExtra(EXTRA_SEND_FILES);
+        String draft = getIntent() == null ? null : getIntent().getStringExtra(EXTRA_DRAFT_TEXT);
+        if (draft != null && draft.length() > 0 && input != null) {
+            getIntent().removeExtra(EXTRA_DRAFT_TEXT);
+            input.setText(draft);
+            input.setSelection(draft.length());
+            Ui.toast(this, "文本已填入，确认后点发送");
+        }
         if (queued != null && !queued.isEmpty() && peer != null) {
             getIntent().removeExtra(EXTRA_SEND_FILES);
             listView.postDelayed(new Runnable() {
@@ -185,6 +194,16 @@ public class ChatActivity extends AppCompatActivity implements Bus.Listener {
         super.onResume();
         Bus.register(this);
         updateStatus();
+        // Bus 是"派发时才快照监听者"，onPause 期间的事件直接丢掉。
+        // 不同步一次的话：传输在后台跑完，回来进度条还停在离开那一刻；
+        // 期间对方发来的文件也完全不显示，必须退出重进才冒出来。
+        if (peer != null && adapter != null) {
+            try {
+                adapter.setData(core.messages.load(peer.deviceId));
+                scrollToBottom();
+            } catch (Throwable ignored) {
+            }
+        }
     }
 
     @Override
@@ -422,6 +441,17 @@ public class ChatActivity extends AppCompatActivity implements Bus.Listener {
             public void run() {
                 java.io.File tmp = new java.io.File(getCacheDir(), "dirpack");
                 if (!tmp.exists()) tmp.mkdirs();
+                // 打包出来的 zip 有几 GB，发完没人删会把 /data 撑爆
+                java.io.File[] olds = tmp.listFiles();
+                if (olds != null) {
+                    long cutoff = System.currentTimeMillis() - 24L * 3600 * 1000;
+                    for (java.io.File o : olds) {
+                        try {
+                            if (o.lastModified() < cutoff) o.delete();
+                        } catch (Throwable ignored) {
+                        }
+                    }
+                }
                 final java.io.File zip = new java.io.File(tmp,
                         "folder-" + System.currentTimeMillis() + ".zip");
                 try {
@@ -791,6 +821,9 @@ public class ChatActivity extends AppCompatActivity implements Bus.Listener {
                         android.content.ClipboardManager cm =
                                 (android.content.ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
                         if (cm != null) {
+                            // 自己复制的内容不该被剪贴板同步推给所有信任设备
+                            com.jiuyue.lanmesh.core.ClipSync.suppressOnce(ChatActivity.this,
+                                    Util.safe(m.text));
                             cm.setPrimaryClip(android.content.ClipData.newPlainText("msg", Util.safe(m.text)));
                             Ui.toast(ChatActivity.this, "已复制");
                         }
@@ -931,6 +964,8 @@ public class ChatActivity extends AppCompatActivity implements Bus.Listener {
                                 android.content.ClipboardManager cm =
                                         (android.content.ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
                                 if (cm != null) {
+                                    com.jiuyue.lanmesh.core.ClipSync.suppressOnce(ChatActivity.this,
+                                            m.localPath);
                                     cm.setPrimaryClip(android.content.ClipData.newPlainText("path", m.localPath));
                                     Ui.toast(ChatActivity.this, "已复制");
                                 }
@@ -945,6 +980,8 @@ public class ChatActivity extends AppCompatActivity implements Bus.Listener {
                             android.content.ClipboardManager cm =
                                     (android.content.ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
                             if (cm != null) {
+                                com.jiuyue.lanmesh.core.ClipSync.suppressOnce(ChatActivity.this,
+                                        Util.safe(m.text));
                                 cm.setPrimaryClip(android.content.ClipData.newPlainText("msg", Util.safe(m.text)));
                                 Ui.toast(ChatActivity.this, "已复制");
                             }
@@ -1072,13 +1109,12 @@ public class ChatActivity extends AppCompatActivity implements Bus.Listener {
         String msg = getString(R.string.trust_msg,
                 TextUtils.isEmpty(req.nickname) ? getString(R.string.unknown_peer) : req.nickname,
                 Util.shortId(req.deviceId));
-        Ui.confirm(this, getString(R.string.trust_title), msg,
+        android.app.Dialog d = Ui.confirm(this, getString(R.string.trust_title), msg,
                 getString(R.string.trust_allow), new Ui.OnClick() {
                     @Override
                     public void onClick() {
                         NetService s = core.service();
                         if (s != null) s.answerTrust(req.deviceId, true);
-                        trustShowing = false;
                     }
                 },
                 getString(R.string.trust_deny), new Ui.OnClick() {
@@ -1086,8 +1122,25 @@ public class ChatActivity extends AppCompatActivity implements Bus.Listener {
                     public void onClick() {
                         NetService s = core.service();
                         if (s != null) s.answerTrust(req.deviceId, false);
-                        trustShowing = false;
                     }
                 });
+        if (d != null) {
+            // 用户点空白处 / 按返回关闭时按钮回调不会执行，不复位的话 trustShowing
+            // 永远是 true，之后所有信任请求都只入队不弹窗，对方干等 60 秒超时。
+            d.setOnDismissListener(new android.content.DialogInterface.OnDismissListener() {
+                @Override
+                public void onDismiss(android.content.DialogInterface di) {
+                    trustShowing = false;
+                    android.view.View anchor = status;
+                    if (anchor == null) return;
+                    anchor.postDelayed(new Runnable() {
+                        @Override
+                        public void run() {
+                            showNextTrust();
+                        }
+                    }, 120);
+                }
+            });
+        }
     }
 }

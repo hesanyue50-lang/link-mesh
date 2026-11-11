@@ -146,7 +146,12 @@ public class DirZip {
         }
         String out = sb.toString().trim();
         if (out.length() == 0) out = "unnamed";
-        if (out.length() > 100) out = out.substring(0, 100);
+        if (out.length() > 100) {
+            // 直接砍尾部会让"前缀相同、后缀不同"的长文件名撞成同名，
+            // putNextEntry 抛 duplicate entry 后被上层 catch 吞掉 → 文件静默丢失。
+            // 保留尾部（后缀往往才是区分点），中间用 ~ 标记省略。
+            out = out.substring(0, 60) + "~" + out.substring(out.length() - 39);
+        }
         return out;
     }
 }

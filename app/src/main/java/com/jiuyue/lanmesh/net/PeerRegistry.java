@@ -7,6 +7,7 @@ import com.jiuyue.lanmesh.model.Peer;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -23,6 +24,9 @@ public class PeerRegistry {
     private static final String PEER_SHORT_PREFIX = "short-";
 
     private final Map<String, Peer> peers = new LinkedHashMap<String, Peer>();
+
+    /** 被用户手动移除的设备 → 忽略到的时间戳（毫秒）。只存在内存里，重启即失效。 */
+    private final Map<String, Long> muted = new HashMap<String, Long>();
     private final Prefs prefs;
     private final String selfId;
 
@@ -98,6 +102,12 @@ public class PeerRegistry {
     public synchronized boolean upsert(String deviceId, String nickname, String host, int port, String source) {
         if (deviceId == null || host == null || port <= 0) return false;
         if (deviceId.equals(selfId)) return false; // 忽略自己（组播会收到自己的包）
+        // 用户手动移除过的设备，30 分钟内不再自动加回来
+        Long mutedUntil = muted.get(deviceId);
+        if (mutedUntil != null) {
+            if (mutedUntil > System.currentTimeMillis()) return false;
+            muted.remove(deviceId);
+        }
 
         // 短 ID 归一：API 19 上 NSD 拿不到 deviceId，会先用 "short-XXXX" 占位；
         // 握手拿到真实 deviceId 后如果不清掉，列表里会永久留一条连不上的"幽灵设备"
@@ -179,6 +189,9 @@ public class PeerRegistry {
 
     public synchronized void remove(String deviceId) {
         peers.remove(deviceId);
+        // 不记住这个忽略，下一轮组播/NSD 的 upsert 会立刻把它加回来，
+        // 用户看到的是"删掉五秒后又自己冒出来了"
+        if (deviceId != null) muted.put(deviceId, System.currentTimeMillis() + 30L * 60 * 1000);
         persistNow();
     }
 

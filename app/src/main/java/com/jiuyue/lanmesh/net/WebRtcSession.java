@@ -254,6 +254,12 @@ public class WebRtcSession {
             fail("会话已关闭");
             return;
         }
+        // 候选必须先入队：onSetSuccess 有可能同步回调 flushRemoteIce，
+        // 那时队列若还是空的，这批候选就永远加不进去了（acceptOffer 路径踩过同样的坑）。
+        for (P2pSignal.IceEntry e : remote.ice) {
+            if (e == null || e.candidate == null) continue;
+            pendingRemoteIce.add(new IceCandidate(e.mid, e.line, e.candidate));
+        }
         pc.setRemoteDescription(new SimpleSdpObserver() {
             @Override
             public void onSetSuccess() {
@@ -261,9 +267,6 @@ public class WebRtcSession {
                 flushRemoteIce();
             }
         }, new SessionDescription(SessionDescription.Type.ANSWER, remote.sdp));
-        for (P2pSignal.IceEntry e : remote.ice) {
-            pendingRemoteIce.add(new IceCandidate(e.mid, e.line, e.candidate));
-        }
     }
 
     private void flushRemoteIce() {

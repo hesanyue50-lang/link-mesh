@@ -429,6 +429,9 @@ public class LsServer {
         synchronized (NAME_LOCK) {
             for (int i = 0; i < 1000; i++) {
                 String cand = i == 0 ? name : base + "(" + i + ")" + ext;
+                // 最终名已存在就换名。原来只判 .part 是否存在，
+                // 于是"下载目录已有 photo.jpg"时 renameTo 会原子替换掉它，旧文件直接消失。
+                if (new File(dir, cand).exists()) continue;
                 File tmp = new File(dir, cand + ".part");
                 try {
                     if (tmp.createNewFile()) {

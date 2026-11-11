@@ -20,6 +20,8 @@ import java.util.List;
  * 信令完全手动：本端生成邀请码/应答码由用户复制给对方，不经过任何服务器。
  */
 public class P2pManager {
+    /** 单个入站文件上限，防止对端用超大 fileSize 把接收端磁盘写满 */
+    private static final long MAX_P2P_BYTES = 64L * 1024 * 1024 * 1024;
 
     private static final String TAG = "LanMeshP2p";
 
@@ -348,10 +350,23 @@ public class P2pManager {
             long size = o.optLong("fileSize", 0);
             int chunk = o.optInt("chunkSize", P2P_CHUNK);
             if (fileId.length() == 0 || size <= 0) return;
+            // chunkSize 完全由对端决定：0 会让每块的写入偏移都算成 0（互相覆盖，
+            // 文件被写坏还校验不过），过小或过大同样会错位。限定到合理区间。
+            if (chunk < 1024 || chunk > 256 * 1024) chunk = P2P_CHUNK;
+            if (size > MAX_P2P_BYTES) {
+                JSONObject rej = new JSONObject();
+                rej.put("fileId", fileId);
+                rej.put("reason", "文件过大");
+                session.sendFrame(Protocol.T_FILE_REJECT,
+                        rej.toString().getBytes("UTF-8"));
+                Bus.post(Bus.P2P_LOG, "拒绝接收 " + name + "：文件过大");
+                return;
+            }
             closeReceive();
             java.io.File dir = com.jiuyue.lanmesh.core.StorageUtil.downloadDir(ctx);
             long free = dir.getUsableSpace();
-            if (free > 0 && free < size + 16L * 1024 * 1024) {
+            // free<=0 时原来整个检查被跳过，于是 setLength(size) 会把 .part 撑成对端说的那么大
+            if (free <= 0 || free < size + 16L * 1024 * 1024) {
                 JSONObject rej = new JSONObject();
                 rej.put("fileId", fileId);
                 rej.put("reason", "存储空间不足");

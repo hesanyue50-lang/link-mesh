@@ -212,7 +212,11 @@ public final class LsClient {
                 kmf.init(ks, "localsend".toCharArray());
                 kms = kmf.getKeyManagers();
             }
-            SSLContext sc = SSLContext.getInstance("TLS");
+            // Android 4.4（API 19）上 "TLS" 默认只协商 SSLv3/TLSv1，
+            // 而官方 LocalSend 最低要求 TLS 1.2，结果是握手直接失败。
+            SSLContext sc = android.os.Build.VERSION.SDK_INT >= 20
+                    ? SSLContext.getInstance("TLS")
+                    : SSLContext.getInstance("TLSv1.2");
             sc.init(kms, trustAll, new SecureRandom());
             return sc.getSocketFactory();
         } catch (Throwable t) {

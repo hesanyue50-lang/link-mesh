@@ -227,6 +227,19 @@ public class ClipSync {
         h.postDelayed(PENDING_READ, DEBOUNCE_MS);
     }
 
+    /**
+     * 立刻读一次剪贴板。
+     * Android 10 起，没有焦点窗口的应用调 getPrimaryClip() 只会拿到 null，
+     * 所以"复制了但没同步"在后台是常态。回到前台时补读一次能补上大部分场景。
+     */
+    public static void pollNow() {
+        boolean on;
+        synchronized (LOCK) {
+            on = listener != null && clipboard != null;
+        }
+        if (on) deliverLatest();
+    }
+
     /** 防抖结束后真正读剪贴板，过滤 + 去重后回调。 */
     private static void deliverLatest() {
         ClipboardManager cm;

@@ -87,15 +87,19 @@ public class Prefs {
         return deviceId != null && trusted().contains(deviceId);
     }
 
+    /** 信任列表的读改写要串行：握手指令可能来自多个连接线程 */
+    private static final Object TRUST_LOCK = new Object();
+
     public void trust(String deviceId) {
         if (deviceId == null) return;
-        Set<String> s = trusted();
-        s.add(deviceId);
-        sp.edit().putStringSet(K_TRUSTED, s).apply();
-        // 允许过的设备从拒绝列表移除，语义上"改主意"成立
-        Set<String> d = denied();
-        if (d.remove(deviceId)) {
-            sp.edit().putStringSet(K_DENIED, d).apply();
+        synchronized (TRUST_LOCK) {
+            Set<String> s = new java.util.HashSet<String>(trusted());
+            s.add(deviceId);
+            // 允许过的设备从拒绝列表移除，语义上"改主意"成立。
+            // 两次写合并成一次提交，避免中途被杀留下"既信任又拒绝"的中间态。
+            Set<String> d = new java.util.HashSet<String>(denied());
+            d.remove(deviceId);
+            sp.edit().putStringSet(K_TRUSTED, s).putStringSet(K_DENIED, d).apply();
         }
     }
 
@@ -279,10 +283,17 @@ public class Prefs {
         sp.edit().putBoolean(K_P2P_LAST, v).apply();
     }
 
-    /** WebDAV 只读端点的密码。Windows 资源管理器不接受空密码，所以给个默认值。 */
+    /**
+     * WebDAV / 整机浏览的密码。Windows 资源管理器不接受空密码，所以必须有值。
+     * 默认值不能用写死的常量——那样等于全网公开口令。首次调用生成 6 位随机数并存下来。
+     */
     public String webdavPassword() {
         String v = sp.getString(K_WEBDAV_PASS, null);
-        if (v == null || v.length() == 0) return "linkmesh";
+        if (v == null || v.length() == 0) {
+            java.util.Random r = new java.util.Random();
+            v = String.format(java.util.Locale.US, "%06d", r.nextInt(1000000));
+            sp.edit().putString(K_WEBDAV_PASS, v).apply();
+        }
         return v;
     }
 

@@ -90,7 +90,11 @@ public class WebShareServer {
             return;
         }
         running = true;
-        pool = Executors.newCachedThreadPool();
+        // 原来用无上限的 cachedThreadPool：每个连接一个线程，几百个空闲连接就能把进程拖死。
+        pool = new java.util.concurrent.ThreadPoolExecutor(4, MAX_CONN, 60L,
+                java.util.concurrent.TimeUnit.SECONDS,
+                new java.util.concurrent.LinkedBlockingQueue<Runnable>(MAX_CONN * 2),
+                new java.util.concurrent.ThreadPoolExecutor.AbortPolicy());
         Thread t = new Thread(new Runnable() {
             @Override
             public void run() {
@@ -113,19 +117,45 @@ public class WebShareServer {
 
     private void acceptLoop() {
         while (running) {
+            Socket s = null;
             try {
-                final Socket s = server.accept();
+                s = server.accept();
+                if (!conns.tryAcquire()) {
+                    // 超过并发上限：直接关掉，别让新连接排队占资源
+                    try { s.close(); } catch (Throwable ignored) {}
+                    continue;
+                }
+                final Socket fs = s;
                 s.setSoTimeout(30000);
                 s.setTcpNoDelay(true);
                 s.setSendBufferSize(256 * 1024);
                 pool.execute(new Runnable() {
                     @Override
                     public void run() {
-                        handle(s);
+                        try {
+                            handle(fs);
+                        } finally {
+                            conns.release();
+                        }
                     }
                 });
+                s = null;
+            } catch (java.util.concurrent.RejectedExecutionException rej) {
+                if (s != null) {
+                    try { s.close(); } catch (Throwable ignored) {}
+                    conns.release();
+                }
+                try { Thread.sleep(20); } catch (InterruptedException ignored) {}
             } catch (Throwable t) {
-                if (running) Log.w(TAG, "accept failed", t);
+                if (s != null) {
+                    try { s.close(); } catch (Throwable ignored) {}
+                    conns.release();
+                }
+                if (running) {
+                    Log.w(TAG, "accept failed", t);
+                    // 句柄耗尽时 accept 会立刻反复失败，不退避就是 100% CPU
+                    try { Thread.sleep(50); } catch (InterruptedException ignored) {}
+                }
             }
         }
     }
@@ -136,21 +166,30 @@ public class WebShareServer {
         try {
             InputStream raw = socket.getInputStream();
             BufferedInputStream in = new BufferedInputStream(raw, 16 * 1024);
-            String requestLine = readLine(in);
+            final long deadline = System.currentTimeMillis() + HEAD_DEADLINE_MS;
+            String requestLine = readLine(in, deadline);
             if (requestLine == null) return;
-            String[] parts = requestLine.split(" ");
-            if (parts.length < 3) return;
-            String method = parts[0];
-            String path = parts[1];
+            // 路径里可能有空格（GET /a b.mp4 HTTP/1.1），所以从两端切，中间全是路径
+            int sp1 = requestLine.indexOf(' ');
+            int sp2 = requestLine.lastIndexOf(' ');
+            if (sp1 <= 0 || sp2 <= sp1) return;
+            String method = requestLine.substring(0, sp1).trim();
+            String path = requestLine.substring(sp1 + 1, sp2).trim();
+            if (path.length() == 0) return;
             String guest = param(path, "g");
             if (guest == null || guest.length() < 4) guest = "guest";
 
-            long contentLength = 0;
+            long contentLength = -1;
+            boolean hasLen = false;
+            boolean chunked = false;
+            String expectHeader = null;
+            String originHeader = null;
+            String hostHeader = null;
             String rangeHeader = null;
             String authHeader = null;
             String depthHeader = null;
             String line;
-            while ((line = readLine(in)) != null && line.length() > 0) {
+            while ((line = readLine(in, deadline)) != null && line.length() > 0) {
                 int idx = line.indexOf(':');
                 if (idx > 0) {
                     String k = line.substring(0, idx).trim().toLowerCase(Locale.US);
@@ -158,8 +197,17 @@ public class WebShareServer {
                     if ("content-length".equals(k)) {
                         try {
                             contentLength = Long.parseLong(v);
+                            hasLen = true;
                         } catch (Throwable ignored) {
                         }
+                    } else if ("transfer-encoding".equals(k)) {
+                        if (v.toLowerCase(Locale.US).contains("chunked")) chunked = true;
+                    } else if ("expect".equals(k)) {
+                        expectHeader = v;
+                    } else if ("host".equals(k)) {
+                        hostHeader = v;
+                    } else if ("origin".equals(k)) {
+                        originHeader = v;
                     } else if ("range".equals(k)) {
                         rangeHeader = v;
                     } else if ("authorization".equals(k)) {
@@ -169,47 +217,97 @@ public class WebShareServer {
                     }
                 }
             }
+            if (contentLength < 0) contentLength = 0;
+            // curl -T 会先等 100-continue 一秒；不回就要干等。非必需但很便宜
+            if (expectHeader != null && expectHeader.toLowerCase(Locale.US).contains("100-continue")) {
+                try {
+                    socket.getOutputStream().write("HTTP/1.1 100 Continue\r\n\r\n".getBytes("UTF-8"));
+                    socket.getOutputStream().flush();
+                } catch (Throwable ignored) {
+                }
+            }
+            // 跨源判定不能只看"有没有 Origin"：浏览器对同源的 POST/PUT 也会带
+            // Origin: http://本机IP:端口，按原来的写法会把网页自己的上传和发消息全判成跨源，
+            // 直接 403。这里把 Origin 的 host:port 和 Host 头比一下。
+            boolean crossOrigin = false;
+            if (originHeader != null && hostHeader != null) {
+                String oh = originHeader;
+                int proto = oh.indexOf("://");
+                if (proto > 0) oh = oh.substring(proto + 3);
+                int slash = oh.indexOf('/');
+                if (slash >= 0) oh = oh.substring(0, slash);
+                crossOrigin = !oh.equalsIgnoreCase(hostHeader.trim());
+            }
 
             String bare = path;
             int qm = bare.indexOf('?');
             if (qm >= 0) bare = bare.substring(0, qm);
 
+            // WebDAV 总开关。之前这个开关只改了设置页文案，服务端根本没读过，
+            // 关掉之后照样能挂载整机存储。
+            boolean davOn = false;
+            try {
+                davOn = com.jiuyue.lanmesh.core.AppCore.get(ctx).prefs.webdavEnabled();
+            } catch (Throwable ignored) {
+            }
+
             if ("OPTIONS".equals(method)) {
                 sendOptions(socket);
             } else if ("PROPFIND".equals(method)) {
-                if (!davAuthorized(authHeader)) {
+                if (!davOn) {
+                    sendStatus(socket, 404, "webdav disabled");
+                } else if (!davAuthorized(authHeader)) {
                     sendAuthRequired(socket);
                 } else {
                     sendPropfind(socket, bare, depthHeader);
                 }
-            } else if (("GET".equals(method) || "HEAD".equals(method))
-                    && authHeader != null && isDavPath(bare)) {
-                // 带 Basic 凭据、又不是应用自己的路由：按 WebDAV 根解析路径
-                if (!davAuthorized(authHeader)) {
+            } else if (("GET".equals(method) || "HEAD".equals(method)) && isDavPath(bare)) {
+                // 不是应用自己的路由：按 WebDAV 根解析路径。
+                // 注意这里不再要求"必须带凭据"，否则无凭据请求会落 404 而不是 401，
+                // Windows 资源管理器就不会弹登录框。
+                if (!davOn) {
+                    sendStatus(socket, 404, "webdav disabled");
+                } else if (!davAuthorized(authHeader)) {
                     sendAuthRequired(socket);
                 } else {
                     sendDavFile(socket, bare, "HEAD".equals(method), rangeHeader);
                 }
-            } else if ("GET".equals(method) && ("/".equals(path) || "/index.html".equals(path))) {
+            } else if ("GET".equals(method) && ("/".equals(bare) || "/index.html".equals(bare))) {
                 sendHtml(socket, page());
-            } else if ("GET".equals(method) && (path.equals("/ls") || path.startsWith("/ls?"))) {
+            } else if ("GET".equals(method) && "/favicon.ico".equals(bare)) {
+                sendStatus(socket, 204, "no content");
+            } else if (("GET".equals(method) || "HEAD".equals(method)) && "/ls".equals(bare)) {
+                if (!requireBrowseAuth(socket, authHeader, path)) return;
                 sendDirListing(socket, paramRaw(path, "path"));
-            } else if ("GET".equals(method) && path.startsWith("/api/state")) {
+            } else if ("GET".equals(method) && bare.startsWith("/api/state")) {
                 sendJson(socket, stateJson(guest));
-            } else if ("GET".equals(method) && path.startsWith("/app.apk")) {
+            } else if ("GET".equals(method) && "/app.apk".equals(bare)) {
                 sendApk(socket);
-            } else if (("GET".equals(method) || "HEAD".equals(method))
-                    && (path.equals("/f") || path.startsWith("/f?"))) {
+            } else if (("GET".equals(method) || "HEAD".equals(method)) && "/f".equals(bare)) {
                 String fp = paramRaw(path, "path");
                 if (fp != null) {
+                    // 浏览整机存储需要凭据，否则同一 Wi-Fi 下任何人都能读走照片和文档
+                    if (!requireBrowseAuth(socket, authHeader, path)) return;
                     boolean inline = "1".equals(param(path, "inline"));
                     sendBrowsed(socket, fp, "HEAD".equals(method), rangeHeader, inline);
                 } else {
                     sendFile(socket, param(path, "name"), "HEAD".equals(method), rangeHeader);
                 }
-            } else if ("GET".equals(method) && path.startsWith("/upload/size")) {
+            } else if ("GET".equals(method) && bare.equals("/upload/size")) {
                 uploadSize(socket, param(path, "name"));
-            } else if ("PUT".equals(method) && path.startsWith("/upload")) {
+            } else if ("PUT".equals(method) && bare.equals("/upload")) {
+                if (crossOrigin) {
+                    sendStatus(socket, 403, "cross-origin");
+                    return;
+                }
+                if (chunked) {
+                    sendStatus(socket, 501, "chunked body not supported");
+                    return;
+                }
+                if (!hasLen) {
+                    sendStatus(socket, 411, "length required");
+                    return;
+                }
                 String name = param(path, "name");
                 long offset = 0;
                 try {
@@ -218,14 +316,29 @@ public class WebShareServer {
                 } catch (Throwable ignored) {
                 }
                 receiveFile(socket, in, name, contentLength, guest, offset);
-            } else if ("POST".equals(method) && path.startsWith("/api/clear")) {
+            } else if ("POST".equals(method) && bare.equals("/api/clear")) {
+                if (crossOrigin) {
+                    sendStatus(socket, 403, "cross-origin");
+                    return;
+                }
                 int n = cleanupAll(ctx);
                 sendJson(socket, "{\"ok\":true,\"removed\":" + n + "}");
-            } else if ("POST".equals(method) && path.startsWith("/text")) {
+            } else if ("POST".equals(method) && bare.equals("/text")) {
+                if (crossOrigin) {
+                    sendStatus(socket, 403, "cross-origin");
+                    return;
+                }
                 byte[] body = readBody(in, contentLength, 64 * 1024);
+                // 超过 64KB 的部分要读掉，否则直接关连接会让部分客户端拿不到响应
+                drain(in, contentLength - body.length, deadline);
                 String msg = new String(body, "UTF-8").trim();
                 if (msg.length() > 0) appendText(guest, msg);
                 sendJson(socket, "{\"ok\":true}");
+            } else if (isDavPath(bare)) {
+                // 挂载成功后用户在资源管理器里复制/新建文件会走到这里，
+                // 回 405 + Allow 比 404 更能说明"是只读端点"而不是"路径不存在"
+                sendStatusEx(socket, 405, "Method Not Allowed", "read-only endpoint",
+                        "Allow: OPTIONS,GET,HEAD,PROPFIND\r\n");
             } else {
                 sendStatus(socket, 404, "not found");
             }
@@ -239,16 +352,51 @@ public class WebShareServer {
         }
     }
 
-    private String readLine(InputStream in) throws Exception {
+    /** 逐字节读一行。deadline 是绝对截止时间：一字节一停的连接会被直接掐掉。 */
+    private String readLine(InputStream in, long deadline) throws Exception {
         StringBuilder sb = new StringBuilder();
-        int c;
+        int c = -1;
         while ((c = in.read()) >= 0) {
             if (c == '\n') break;
             if (c != '\r') sb.append((char) c);
-            if (sb.length() > 8192) break;
+            if (sb.length() > 8192) {
+                // 超长头行直接失败。原来 break 会让后面的字节被当成下一行，
+                // 解析错位后 Content-Length 可以被绕过。
+                throw new java.io.IOException("header line too long");
+            }
+            if ((sb.length() & 0xFF) == 0 && System.currentTimeMillis() > deadline) {
+                throw new java.io.IOException("slow request");
+            }
         }
         if (c < 0 && sb.length() == 0) return null;
         return sb.toString();
+    }
+
+    /** 把剩余请求体读掉丢弃，避免直接关连接给客户端 RST。 */
+    private void drain(InputStream in, long bytes, long deadline) {
+        if (bytes <= 0) return;
+        try {
+            byte[] buf = new byte[8192];
+            long left = bytes;
+            while (left > 0) {
+                int r = in.read(buf, 0, (int) Math.min(buf.length, left));
+                if (r < 0) break;
+                left -= r;
+                if (System.currentTimeMillis() > deadline + 10000L) break;
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /**
+     * 浏览整机存储的凭据校验（和 WebDAV 共用同一个密码）。
+     * 也接受 ?t=<password>：<img>/<video> 这类浏览器自己发起的请求加不了 Authorization 头。
+     */
+    private boolean requireBrowseAuth(Socket socket, String authHeader, String path) throws Exception {
+        if (davAuthorized(authHeader)) return true;
+        if (passOk(param(path, "t"))) return true;
+        sendAuthRequired(socket);
+        return false;
     }
 
     private byte[] readBody(InputStream in, long length, int limit) throws Exception {
@@ -400,6 +548,19 @@ public class WebShareServer {
 
     /** 单目录最多返回的条目数，超大目录不至于把手机和浏览器一起拖死。 */
     private static final int LS_LIMIT = 2000;
+
+    /** 同时处理的连接上限。每个连接一个线程，不设限会被"连上慢慢发字节"拖垮。 */
+    private static final int MAX_CONN = 32;
+
+    /** 单个请求读头部的绝对截止时间，防止用一字节一停的方式永久占线程。 */
+    private static final long HEAD_DEADLINE_MS = 20000L;
+
+    private final java.util.concurrent.Semaphore conns =
+            new java.util.concurrent.Semaphore(MAX_CONN);
+
+    /** 同名文件并发上传串行化（续传语义要求固定文件名，不能靠改名避开冲突）。 */
+    private static final java.util.concurrent.ConcurrentHashMap<String, Object> UP_LOCKS =
+            new java.util.concurrent.ConcurrentHashMap<String, Object>();
 
     /**
      * 浏览根目录：优先外部存储根（Android 11+ 需要「所有文件访问」权限），
@@ -587,44 +748,61 @@ public class WebShareServer {
         String safe = headerSafe(name);
         long total = f.length();
         long start = 0;
-        long end = total - 1;
+        long end = total > 0 ? total - 1 : -1;
+        boolean hasRange = false;
         if (range != null && range.startsWith("bytes=")) {
+            hasRange = true;
             try {
                 String spec = range.substring(6).split(",")[0].trim();
                 int dash = spec.indexOf('-');
                 if (dash >= 0) {
                     String a = spec.substring(0, dash).trim();
                     String b = spec.substring(dash + 1).trim();
-                    if (a.length() > 0) start = Long.parseLong(a);
-                    if (b.length() > 0) end = Long.parseLong(b);
-                }
-                if (start < 0) start = 0;
-                if (end >= total) end = total - 1;
-                if (start > end) {
-                    sendStatus(socket, 416, "range");
-                    return;
+                    if (a.length() == 0 && b.length() > 0) {
+                        // bytes=-N 是"最后 N 个字节"。原来这里 a 为空时 start 仍是 0，
+                        // 把 N 当成了结束位置，结果返回文件开头而不是结尾。
+                        long n = Long.parseLong(b);
+                        if (n <= 0 || total <= 0) {
+                            sendStatusEx(socket, 416, "Range Not Satisfiable", "bad range",
+                                    "Content-Range: bytes */" + total + "\r\n");
+                            return;
+                        }
+                        start = Math.max(0, total - n);
+                        end = total - 1;
+                    } else {
+                        if (a.length() > 0) start = Long.parseLong(a);
+                        if (b.length() > 0) end = Long.parseLong(b);
+                        if (start < 0) start = 0;
+                        if (end >= total) end = total - 1;
+                    }
+                    if (total <= 0 || start > end || start >= total) {
+                        sendStatusEx(socket, 416, "Range Not Satisfiable", "bad range",
+                                "Content-Range: bytes */" + total + "\r\n");
+                        return;
+                    }
                 }
             } catch (Throwable t) {
                 start = 0;
-                end = total - 1;
+                end = total > 0 ? total - 1 : -1;
+                hasRange = false;
             }
         }
-        if (total == 0) {
-            OutputStream empty = socket.getOutputStream();
-            empty.write(("HTTP/1.1 200 OK\r\nContent-Type: " + contentType + "\r\n"
-                    + "Content-Length: 0\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n")
-                    .getBytes("UTF-8"));
-            empty.flush();
-            return;
-        }
-        boolean partial = start > 0 || end < total - 1;
-        long len = end - start + 1;
+        long len = total <= 0 ? 0 : end - start + 1;
+        // 只要客户端带了 Range 且能命中，就必须回 206（RFC 7233），
+        // 否则部分下载器会认为服务器不支持 Range，整份重下
+        boolean partial = hasRange && len > 0;
+        boolean unsafeInline = inline
+                && (contentType.startsWith("text/html") || contentType.contains("svg"));
         OutputStream out = socket.getOutputStream();
         String header = "HTTP/1.1 " + (partial ? "206 Partial Content" : "200 OK") + "\r\n"
                 + "Content-Type: " + contentType + "\r\n"
                 + "Content-Length: " + len + "\r\n"
                 + "Accept-Ranges: bytes\r\n"
                 + (partial ? "Content-Range: bytes " + start + "-" + end + "/" + total + "\r\n" : "")
+                + "Date: " + httpDate(System.currentTimeMillis()) + "\r\n"
+                + "Last-Modified: " + httpDate(f.lastModified()) + "\r\n"
+                + (unsafeInline ? "X-Content-Type-Options: nosniff\r\n"
+                        + "Content-Security-Policy: sandbox\r\n" : "")
                 + "Content-Disposition: " + (inline ? "inline" : "attachment")
                 + "; filename=\"" + safe + "\""
                 + "; filename*=UTF-8''" + urlEncode(safe) + "\r\n"
@@ -693,47 +871,68 @@ public class WebShareServer {
             return;
         }
         String safe = Util.safeFileName(name);
-        File relay = relayDir();
-        long free = relay.getUsableSpace();
-        if (length > 0 && free > 0 && free < length + 16L * 1024 * 1024) {
-            sendStatus(socket, 507, "insufficient storage");
+        // ".."/"." 会被 safeFileName 原样放过，new File(relay, "..") 指向父目录本身
+        if (safe == null || safe.length() == 0 || ".".equals(safe) || "..".equals(safe)
+                || safe.indexOf('/') >= 0 || safe.indexOf('\\') >= 0) {
+            sendStatus(socket, 400, "bad name");
             return;
         }
-        File target = new File(relay, safe);
-        if (offset > 0 && (!target.isFile() || target.length() != offset)) {
-            // 浏览器报告的续传点和服务端实际收到的字节不一致：从头来
-            offset = 0;
-        }
-        if (offset <= 0) {
-            // 固定文件名：否则同名上传会被 uniqueFile 改名，浏览器续传就找不到原文件
-            target = new File(relayDir(), safe);
-            if (target.isFile()) target.delete();
-        }
-        java.io.RandomAccessFile out = new java.io.RandomAccessFile(target, "rw");
-        if (offset > 0) {
-            out.seek(offset);
-        } else {
-            out.setLength(0);
-        }
-        long left = length;
-        byte[] buf = new byte[256 * 1024];
-        try {
-            while (left > 0) {
-                int r = in.read(buf, 0, (int) Math.min(buf.length, left));
-                if (r < 0) break;
-                out.write(buf, 0, r);
-                left -= r;
+        File relay = relayDir();
+        long free = relay.getUsableSpace();
+        // 加法溢出：length 接近 Long.MAX_VALUE 时 need 变负数，507 保护就失效了
+        if (length > 0 && free > 0) {
+            long need = length + 16L * 1024 * 1024;
+            if (need < 0 || free < need) {
+                sendStatus(socket, 507, "insufficient storage");
+                return;
             }
-        } finally {
-            out.close();
         }
-        if (offset <= 0) addFileMessage(guest, target);
-        String json = "{\"ok\":true,\"name\":\"" + target.getName().replace("\"", "")
-                + "\",\"size\":" + target.length() + "}";
-        sendJson(socket, json);
-        if (offset <= 0) {
-            Bus.post(Bus.TOAST, "浏览器上传: " + target.getName()
-                    + " (" + Util.humanSize(target.length()) + ")");
+        // 固定文件名是续传的前提（改名就找不到原文件），所以同名并发只能串行
+        Object lock = UP_LOCKS.get(safe);
+        if (lock == null) {
+            Object fresh = new Object();
+            Object prev = UP_LOCKS.putIfAbsent(safe, fresh);
+            lock = prev != null ? prev : fresh;
+        }
+        synchronized (lock) {
+            File target = new File(relay, safe);
+            if (offset > 0 && (!target.isFile() || target.length() != offset)) {
+                // 服务端和浏览器对续传点的认知不一致。原来是服务端悄悄归零，
+                // 浏览器仍按自己的 offset 发后半截，结果写到文件开头，内容全错还回 ok。
+                sendStatus(socket, 409, "offset mismatch");
+                return;
+            }
+            if (offset <= 0 && target.isFile()) target.delete();
+            java.io.RandomAccessFile out = new java.io.RandomAccessFile(target, "rw");
+            long left = length;
+            boolean complete = length == 0;
+            byte[] buf = new byte[256 * 1024];
+            try {
+                if (offset > 0) out.seek(offset); else out.setLength(0);
+                while (left > 0) {
+                    int r = in.read(buf, 0, (int) Math.min(buf.length, left));
+                    if (r < 0) break;
+                    out.write(buf, 0, r);
+                    left -= r;
+                }
+                complete = left == 0;
+            } finally {
+                out.close();
+            }
+            if (!complete) {
+                // 客户端中途断开（网页取消/网络断）：半截文件不能当收全了入库
+                try { target.delete(); } catch (Throwable ignored) {}
+                sendStatus(socket, 400, "incomplete body");
+                return;
+            }
+            if (offset <= 0) addFileMessage(guest, target);
+            String json = "{\"ok\":true,\"name\":\"" + target.getName().replace("\"", "")
+                    + "\",\"size\":" + target.length() + "}";
+            sendJson(socket, json);
+            if (offset <= 0) {
+                Bus.post(Bus.TOAST, "浏览器上传: " + target.getName()
+                        + " (" + Util.humanSize(target.length()) + ")");
+            }
         }
     }
 
@@ -800,7 +999,7 @@ public class WebShareServer {
     private void sendOptions(Socket socket) throws Exception {
         OutputStream out = socket.getOutputStream();
         String header = "HTTP/1.1 200 OK\r\n"
-                + "DAV: 1, 2\r\n"
+                + "DAV: 1\r\n"
                 + "MS-Author-Via: DAV\r\n"
                 + "Allow: OPTIONS,GET,HEAD,PROPFIND\r\n"
                 + "Content-Length: 0\r\n"
@@ -813,6 +1012,17 @@ public class WebShareServer {
      * Basic Auth：用户名不校验，密码必须等于设置里的 WebDAV 密码。
      * Windows 资源管理器不接受空密码，所以空密码一律拒绝。
      */
+    private boolean passOk(String candidate) {
+        if (candidate == null || candidate.length() == 0) return false;
+        String expected;
+        try {
+            expected = com.jiuyue.lanmesh.core.AppCore.get(ctx).prefs.webdavPassword();
+        } catch (Throwable t) {
+            return false;
+        }
+        return expected != null && expected.length() > 0 && expected.equals(candidate);
+    }
+
     private boolean davAuthorized(String authHeader) {
         if (authHeader == null) return false;
         String h = authHeader.trim();
@@ -827,20 +1037,12 @@ public class WebShareServer {
         }
         int colon = plain.indexOf(':');
         if (colon < 0) return false;
-        String pass = plain.substring(colon + 1);
-        String expected;
-        try {
-            expected = com.jiuyue.lanmesh.core.AppCore.get(ctx).prefs.webdavPassword();
-        } catch (Throwable t) {
-            return false;
-        }
-        if (expected == null || expected.length() == 0) return false;
-        return expected.equals(pass);
+        return passOk(plain.substring(colon + 1));
     }
 
     private void sendAuthRequired(Socket socket) throws Exception {
         sendStatusEx(socket, 401, "Unauthorized", "authentication required",
-                "WWW-Authenticate: Basic realm=\"Link Mesh\"\r\nDAV: 1, 2\r\n");
+                "WWW-Authenticate: Basic realm=\"Link Mesh\"\r\nDAV: 1\r\n");
     }
 
     /** PROPFIND：Depth 0 只回自身，Depth 1（默认）带上直接子项。 */
@@ -876,7 +1078,7 @@ public class WebShareServer {
         String header = "HTTP/1.1 207 Multi-Status\r\n"
                 + "Content-Type: application/xml; charset=utf-8\r\n"
                 + "Content-Length: " + body.length + "\r\n"
-                + "DAV: 1, 2\r\n"
+                + "DAV: 1\r\n"
                 + "Connection: close\r\n\r\n";
         out.write(header.getBytes("UTF-8"));
         out.write(body);
@@ -1108,6 +1310,9 @@ public class WebShareServer {
                     return a.timestamp < b.timestamp ? -1 : 1;
                 }
             });
+            // 只回最近 120 条，但要有总数：前端原来按 list.length 判断有没有新消息，
+            // 超过 120 条后长度被钉死，网页端就再也不刷新了
+            o.put("total", all.size());
             int from = Math.max(0, all.size() - 120);
             JSONArray msgs = new JSONArray();
             for (int i = from; i < all.size(); i++) {
@@ -1249,6 +1454,11 @@ public class WebShareServer {
                 + "var G=(function(){var v=localStorage.getItem('lm_guest');"
                 + "if(!v){v='g'+Math.random().toString(36).slice(2,10);localStorage.setItem('lm_guest',v);}return v;})();"
                 + "var Q='?g='+encodeURIComponent(G);"
+                + "var PW=localStorage.getItem('lm_pw')||'';"
+                + "function authH(){var h={};if(PW)h['Authorization']='Basic '+btoa('u:'+PW);return h;}"
+                + "function TK(){return PW?('&t='+encodeURIComponent(PW)):'';}"
+                + "function askPw(){var v=prompt('输入密码（App 的「工具」页可以查看）');"
+                + "if(v){PW=v.trim();localStorage.setItem('lm_pw',PW);return true;}return false;}"
                 + "function esc(s){s=(s===null||s===undefined)?'':''+s;return s.replace(/[&<>\"']/g,"
                 + "function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',\"'\":'&#39;'}[c];});}"
                 + "function fmt(t){var d=new Date(t);function p(n){return n<10?'0'+n:''+n;}"
@@ -1272,7 +1482,8 @@ public class WebShareServer {
                 + "document.getElementById('name').textContent=d.name||'';"
                 + "document.getElementById('sub').textContent=(d.me?d.me+' · ':'')+(d.shortId||'')+' · '+(d.ip||'')+':'+d.port;"
                 + "var list=d.messages||[];"
-                + "if(list.length!==lastCount){lastCount=list.length;var html='';"
+                + "var total=(d.total!=null?d.total:list.length);"
+                + "if(total!==lastCount){lastCount=total;var html='';"
                 + "list.forEach(function(m){var cls=m.mine?'mine':'other';"
                 + "html+='<div class=msg '+cls+'><div class=from>'+esc(m.from||'')+'</div>';"
                 + "if(m.type==='file'){html+='<div class=fname>'+esc(m.name)+'</div>';"
@@ -1280,7 +1491,9 @@ public class WebShareServer {
                 + "html+='<a class=fdl data-n=\"'+encodeURIComponent(m.name)+'\">下载</a>';}"
                 + "else{html+='<div class=copy data-c=\"'+encodeURIComponent(m.text||'')+'\">'+esc(m.text)+'</div>';}"
                 + "html+='<time>'+fmt(m.time)+'</time></div>';});"
+                + "var liveUp=up&&up.wrap;"
                 + "box.innerHTML=html||'<div class=empty>还没有消息<br>发一条试试，或点左下角 + 上传文件</div>';"
+                + "if(liveUp&&liveUp.parentNode!==box)box.appendChild(liveUp);"
                 + "if(keep)toBottom();}}).catch(function(){});}"
                 + "function send(){var el=document.getElementById('msg');var v=el.value.trim();if(!v)return;"
                 + "el.value='';fetch('/text'+Q,{method:'POST',body:v}).then(function(){lastCount=-1;refresh();});}"
@@ -1289,7 +1502,10 @@ public class WebShareServer {
                 + "x.open('PUT','/upload?name='+encodeURIComponent(up.file.name)+'&offset='+off+'&g='+encodeURIComponent(G));"
                 + "x.upload.onprogress=function(e){if(!e.lengthComputable)return;var d=off+e.loaded;up.sent=d;"
                 + "up.bar.style.width=(d/up.file.size*100)+'%';up.time.textContent=(d/1048576).toFixed(1)+' / '+(up.file.size/1048576).toFixed(1)+' MB';};"
-                + "x.onload=function(){if(x.status===200){up.wrap&&up.wrap.remove();up.xhr=null;lastCount=-1;refresh();}else{up.time.textContent='上传失败';}};"
+                + "x.onload=function(){if(x.status===200){up.wrap&&up.wrap.remove();up.xhr=null;lastCount=-1;refresh();}"
+                + "else if(x.status===409){up.xhr=null;up.sent=0;startUp(0);}"
+                + "else if(x.status===401){up.time.textContent='需要密码';askPw();}"
+                + "else{up.time.textContent='上传失败';}};"
                 + "x.onerror=function(){if(!up.paused&&!up.cancel)up.time.textContent='上传失败';};"
                 + "x.send(off>0?up.file.slice(off):up.file);}"
                 + "function upload(){var f=document.getElementById('f').files[0];if(!f)return;"
@@ -1314,7 +1530,8 @@ public class WebShareServer {
                 + "function ui(t,p){tm.textContent=t;if(p!=null)bar.style.width=p+'%';}"
                 + "function next(){if(st.paused||st.cancel)return;var end=Math.min(st.total,st.off+CH)-1;"
                 + "var x=new XMLHttpRequest();st.xhr=x;x.open('GET','/f?name='+encodeURIComponent(st.name));"
-                + "if(st.off>0)x.setRequestHeader('Range','bytes='+st.off+'-'+end);x.responseType='arraybuffer';"
+                + "x.setRequestHeader('Range','bytes='+st.off+'-'+end);x.responseType='arraybuffer';"
+                + "var ah=authH();for(var ak in ah)x.setRequestHeader(ak,ah[ak]);"
                 + "x.onload=function(){if(st.cancel)return;if(x.status!==200&&x.status!==206){ui('下载失败');return;}"
                 + "st.chunks.push(x.response);st.off+=x.response.byteLength;"
                 + "ui((st.off/1048576).toFixed(1)+' / '+(st.total/1048576).toFixed(1)+' MB',st.off/st.total*100);"
@@ -1359,7 +1576,7 @@ public class WebShareServer {
                 + "if(it.dir){out+='<div class=\"frow\" data-dir=\"'+esc(p)+'\"><div class=\"fico\">▸</div>"
                 + "<div class=\"fmain\"><div class=\"fnm\">'+esc(it.name)+'/</div>"
                 + "<div class=\"fsub\">文件夹 · '+fmt(it.mtime)+'</div></div></div>';}"
-                + "else{var href='/f?path='+encodeURIComponent(p);"
+                + "else{var href='/f?path='+encodeURIComponent(p)+TK();"
                 + "var play=MEDIA[extOf(it.name)]?'<a href=\"'+href+'&amp;inline=1\" target=\"_blank\" "
                 + "rel=\"noopener\">打开</a>':'';"
                 + "out+='<div class=\"frow\"><div class=\"fico\">·</div><div class=\"fmain\">"
@@ -1370,7 +1587,8 @@ public class WebShareServer {
                 + "if(fb.truncated){out+='<div class=\"fempty\">只显示前 2000 项</div>';}"
                 + "elm('flist').innerHTML=out;}"
                 + "function loadDir(p){fb.path=p||'';elm('flist').innerHTML='<div class=\"fempty\">正在读取…</div>';"
-                + "fetch('/ls?path='+encodeURIComponent(fb.path)).then(function(r){"
+                + "fetch('/ls?path='+encodeURIComponent(fb.path)+TK(),{headers:authH()}).then(function(r){"
+                + "if(r.status===401){if(askPw()){loadDir(fb.path);return;}throw new Error('401');}"
                 + "if(r.status!==200)throw new Error(''+r.status);return r.json();}).then(function(d){"
                 + "fb.path=d.path||'';fb.items=d.items||[];fb.root=d.root||'文件';"
                 + "fb.truncated=!!d.truncated;renderBar();renderList();}).catch(function(){"

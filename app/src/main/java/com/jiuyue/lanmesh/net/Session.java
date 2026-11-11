@@ -27,6 +27,8 @@ import java.util.BitSet;
  * 半死不活的 socket。
  */
 public class Session implements Runnable {
+    /** 单个入站文件的大小上限，防对端用超大 fileSize 把接收端存储写满 */
+    private static final long MAX_INCOMING_BYTES = 64L * 1024 * 1024 * 1024;
 
     private static final String TAG = "LanMeshSession";
 
@@ -98,11 +100,15 @@ public class Session implements Runnable {
             if (peer == null) return;
             peer.nickname = nickname;
             peer.lastSeen = System.currentTimeMillis();
-            if (listenPort > 0) peer.port = listenPort;
-            peer.host = host;
-            prefs.rememberPeerAddress(deviceId, host, listenPort > 0 ? listenPort : peer.port);
-
             boolean trusted = prefs.isTrusted(deviceId);
+            // deviceId 是对方自称的，来源 IP 也不是身份。已信任设备的地址只允许由
+            // 发现广播或本机主动连接更新，否则同网段任何人发一个伪造 HELLO
+            // 就能把"你朋友"的地址改到自己身上，之后发过去的文件全进了攻击者手里。
+            if (!trusted) {
+                if (listenPort > 0) peer.port = listenPort;
+                peer.host = host;
+                prefs.rememberPeerAddress(deviceId, host, listenPort > 0 ? listenPort : peer.port);
+            }
             if (!trusted) {
                 if (prefs.isDenied(deviceId)) {
                     JSONObject o = new JSONObject();
@@ -262,8 +268,14 @@ public class Session implements Runnable {
             reject(writer, fileId, "无法创建保存目录");
             return;
         }
+        // fileSize 完全由对端决定，且后面会 raf.setLength(fileSize)。
+        // 一个 6TB 的声称值在 free==0 的机型上能直接跳过检查、把 .part 撑爆磁盘。
+        if (fileSize <= 0 || fileSize > MAX_INCOMING_BYTES) {
+            reject(writer, fileId, "文件过大或大小非法");
+            return;
+        }
         long free = dir.getUsableSpace();
-        if (free > 0 && free < fileSize + 8L * 1024 * 1024) {
+        if (free <= 0 || free < fileSize + 8L * 1024 * 1024) {
             reject(writer, fileId, "对方存储空间不足");
             return;
         }
@@ -425,6 +437,14 @@ public class Session implements Runnable {
                 } else if (f.type == Protocol.T_FILE_DONE) {
                     String senderSha = f.json().optString("sha256", sha);
                     if (senderSha.length() > 0) sha = senderSha;
+                    // "对方发完了"不等于"我收全了"：中间有块丢了也会走到这里。
+                    // 不数位图就直接 ok=true，会得到一个满是空洞、却标成已完成的文件。
+                    int got = 0;
+                    for (int i = 0; i < totalChunks; i++) if (bits.get(i)) got++;
+                    if (got != totalChunks) {
+                        error = "对方提前结束，缺 " + (totalChunks - got) + " 块";
+                        break;
+                    }
                     ok = true;
                     break;
                 } else if (f.type == Protocol.T_PAUSE) {
@@ -491,7 +511,10 @@ public class Session implements Runnable {
         } catch (Throwable t) {
             actual = "";
         }
-        boolean hashOk = sha.length() == 0 || actual.equalsIgnoreCase(sha);
+        // 原来写成"没有校验值就算通过"，等于把安全判断交给对端：
+        // 只要它不发 sha256，传一半断开也会被当成成功。
+        boolean hashOk = sha.length() == 64 && actual.length() == 64
+                && actual.equalsIgnoreCase(sha);
         if (!hashOk) {
             msg.status = ChatMessage.ST_FAILED;
             msg.error = "SHA-256 校验失败";
@@ -515,6 +538,16 @@ public class Session implements Runnable {
         File target = Util.uniqueFile(dir, fileName);
         if (partFile.renameTo(target)) {
             stateFile.delete();
+            // 先回执再做后续处理：往 SAF 目录复制 4GB 要几分钟，
+            // 而发送端只等 120 秒 —— 晚回会让它显示"发送失败"，这边却显示已接收。
+            try {
+                JSONObject early = new JSONObject();
+                early.put("fileId", fileId);
+                early.put("ok", true);
+                early.put("sha256", actual);
+                writer.writeJson(Protocol.T_FILE_RESULT, early);
+            } catch (Throwable ignored) {
+            }
             // 如果用户在设置里选了 SAF 目录（公共文件夹），把文件复制过去，
             // 否则 Android/data 下的文件第三方文件管理器没有权限打开。
             String tree = prefs.saveTreeUri();
@@ -535,19 +568,20 @@ public class Session implements Runnable {
             recordHistory(msg, true, null, peer);
             Bus.toast("已接收 " + target.getName());
             transfer.notifyDone("已接收 " + target.getName());
-            try {
-                JSONObject r = new JSONObject();
-                r.put("fileId", fileId);
-                r.put("ok", true);
-                r.put("sha256", actual);
-                writer.writeJson(Protocol.T_FILE_RESULT, r);
-            } catch (Throwable ignored) {
-            }
         } else {
             msg.status = ChatMessage.ST_FAILED;
             msg.error = "文件重命名失败";
             store.update(msg);
             Bus.post(Bus.MESSAGE_UPDATED, msg);
+            // 不回执的话发送端要空等到读超时，用户看到的是"发送失败：Read timed out"
+            try {
+                JSONObject r = new JSONObject();
+                r.put("fileId", fileId);
+                r.put("ok", false);
+                r.put("error", "对方保存文件失败");
+                writer.writeJson(Protocol.T_FILE_RESULT, r);
+            } catch (Throwable ignored) {
+            }
         }
     }
 

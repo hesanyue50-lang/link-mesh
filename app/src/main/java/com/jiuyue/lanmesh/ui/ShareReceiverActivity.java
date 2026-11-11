@@ -27,8 +27,14 @@ public class ShareReceiverActivity extends Activity {
     /** 主界面启动时扫描这个目录里的待发文件 */
     public static final String SHARE_DIR = "share_in";
 
+    /**
+     * 优先外部 cache：内部 /data 分区容量远小于 /sdcard，分享一个几 GB 的视频
+     * 会直接 ENOSPC，而报错文本是"读取分享的文件失败"，用户完全看不出真正原因。
+     */
     public static File shareDir(android.content.Context ctx) {
-        File d = new File(ctx.getCacheDir(), SHARE_DIR);
+        File base = ctx.getExternalCacheDir();
+        if (base == null) base = ctx.getCacheDir();
+        File d = new File(base, SHARE_DIR);
         if (!d.exists()) d.mkdirs();
         return d;
     }
@@ -50,7 +56,21 @@ public class ShareReceiverActivity extends Activity {
             }
         }
         if (uris.isEmpty()) {
-            // 纯文字分享不走这条路径
+            // 从浏览器/笔记分享过来的是纯文本，没有 EXTRA_STREAM。
+            // 直接退出会让用户觉得"选了 Link Mesh 什么也没发生"，这里接住它。
+            String text = it == null ? null : it.getStringExtra(Intent.EXTRA_TEXT);
+            if (text != null && text.trim().length() > 0) {
+                Intent m = new Intent(this, MainActivity.class);
+                m.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+                m.putExtra("from_share", true);
+                m.putExtra("from_share_text", text.trim());
+                try {
+                    startActivity(m);
+                } catch (Throwable ignored) {
+                }
+                finish();
+                return;
+            }
             toast("没有可发送的文件");
             finish();
             return;
@@ -84,12 +104,14 @@ public class ShareReceiverActivity extends Activity {
 
     private int copyAll(ArrayList<Uri> uris) {
         File dir = shareDir(this);
-        // 上一批没发出去的残留先清掉，避免新旧混在一起
+        // 只清一天前的残留。原来是无条件清空，于是"文件已暂存，等设备上线再发"
+        // 这句提示是假的：用户再分享一次，上一批就被删了，永远发不出去。
         File[] old = dir.listFiles();
         if (old != null) {
+            long cutoff = System.currentTimeMillis() - 24L * 3600 * 1000;
             for (File f : old) {
                 try {
-                    f.delete();
+                    if (f.lastModified() < cutoff) f.delete();
                 } catch (Throwable ignored) {
                 }
             }
@@ -99,6 +121,25 @@ public class ShareReceiverActivity extends Activity {
             Uri u = uris.get(i);
             String name = guessName(u, i);
             File dst = new File(dir, prefix(i) + "_" + name);
+            // 先看要写多少，空间不够就跳过并说明原因，别等写到一半 ENOSPC
+            long need = -1;
+            try {
+                android.os.ParcelFileDescriptor pfd = getContentResolver().openFileDescriptor(u, "r");
+                if (pfd != null) {
+                    need = pfd.getStatSize();
+                    pfd.close();
+                }
+            } catch (Throwable ignored) {
+            }
+            if (need > 0 && need > dir.getUsableSpace()) {
+                ui.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        toast("存储空间不足，跳过一个文件");
+                    }
+                });
+                continue;
+            }
             InputStream in = null;
             OutputStream out = null;
             try {
